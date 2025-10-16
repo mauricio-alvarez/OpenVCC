@@ -9,7 +9,7 @@ import numpy as np
 
 import torch
 import random
-
+import pickle
 import vcc_helpers
 from vcc import ConceptDiscovery, make_model
 
@@ -85,7 +85,8 @@ def main(args):
       min_imgs=args.min_imgs,
       num_discovery_imgs=args.num_discovery_imgs,
       correct_incorect=args.correct_incorect,
-      save_acts=args.save_acts)
+      save_acts=args.save_acts,
+      bs=8)
 
 
     print('Creating the dataset of feature segments for all layers')
@@ -93,7 +94,9 @@ def main(args):
     cd.create_patches_top_down(n_top_clusters=int(args.num_segment_clusters[0]),resize_factor=args.resize_factor)
     end = time.time()
     print('Segment dataset creation took {:.2f} minutes'.format((end - start)/60))
-
+    print('Clearing GPU Cache')
+    import torch
+    torch.cuda.empty_cache()
     # Saving the concept discovery target class images
     print('Saving the concept discovery target class images')
     image_dir = os.path.join(dataset_dir, 'discovery_images')
@@ -139,6 +142,11 @@ def main(args):
     print('Calculating ITCAVS took {:.1f} minutes'.format((end - start) / 60))
 
     vcc_helpers.save_ace_report(cd, cav_accuracies, cd.scores, results_summaries_dir)
+
+    print('Saving concept discovery object to cd.pkl...')
+    cd_path = os.path.join(args.working_dir, 'cd.pkl')
+    with open(cd_path, 'wb') as f:
+        pickle.dump(cd, f)
 
     # cleaning up dirs to save space
     if not args.save_acts:

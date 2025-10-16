@@ -209,11 +209,19 @@ class ConceptDiscovery(object):
 
     for bn in self.bottlenecks:
       discovery_acts = np.concatenate(output[bn], axis=0)
-      discovery_acts = np.array(torch.nn.functional.interpolate(torch.tensor(discovery_acts.transpose(0, 3, 1, 2)).type(torch.float32),
-                                                                size=(int(img_batch.shape[1] / resize_factor),
-                                                                      int(img_batch.shape[2] / resize_factor)),
-                                                                mode='bilinear')).transpose(0, 2, 3, 1)
-      output[bn] = discovery_acts
+      discovery_acts_torch = torch.tensor(discovery_acts.transpose(0, 3, 1, 2)).type(torch.float32)
+      interpolated_acts = torch.nn.functional.interpolate(
+          discovery_acts_torch,
+          size=(int(img_batch.shape[1] / resize_factor), int(img_batch.shape[2] / resize_factor)),
+          mode='bilinear'
+      )
+      output[bn] = np.array(interpolated_acts).transpose(0, 2, 3, 1)
+      # discovery_acts = np.concatenate(output[bn], axis=0)
+      # discovery_acts = np.array(torch.nn.functional.interpolate(torch.tensor(discovery_acts.transpose(0, 3, 1, 2)).type(torch.float32),
+      #                                                          size=(int(img_batch.shape[1] / resize_factor),
+      #                                                          int(img_batch.shape[2] / resize_factor)),
+      #                                                          mode='bilinear')).transpose(0, 2, 3, 1)
+      # output[bn] = discovery_acts
 
 
     # hierarchical activation segmentation
@@ -444,8 +452,12 @@ class ConceptDiscovery(object):
 
     for bn in self.bottlenecks:
       output[bn] = np.concatenate(output[bn], 0)
-      if channel_mean and len(output[bn].shape) > 3:
-        output[bn] = np.mean(output[bn], (1, 2))
+      if channel_mean:
+          if len(output[bn].shape) > 2:
+              # Average across the patch dimension (axis 1)
+              output[bn] = np.mean(output[bn], tuple(range(1,output[bn].ndim -1)))
+          else:
+            output[bn] = np.reshape(output[bn], [output[bn].shape[0], -1])
       else:
         output[bn] = np.reshape(output[bn], [output[bn].shape[0], -1])
     return output
@@ -808,14 +820,7 @@ class ConceptDiscovery(object):
       self.dic[bn]['concepts'] = concepts
 
   def _return_logit_gradients(self, images):
-    """For the given images calculates the gradient tensors.
-
-    Args:
-      images: Images for which we want to calculate gradients.
-
-    Returns:
-      A dictionary of images gradients in all bottleneck layers.
-    """
+    """For the given images calculates the gradient tensors. (Final Corrected Version)"""
     gradients = {}
     if not self.target_class == 'all':
       try:
@@ -824,18 +829,18 @@ class ConceptDiscovery(object):
         class_id = self.model.label_to_id[self.target_class.lower()]
     for bn in self.bottlenecks:
       acts = self.get_acts_from_images(images,bn, return_cls_token=True)
-      if not self.args.model_to_run.find('vit') > -1 or self.args.model_to_run == 'mvit':
+      
+      bn_grads = np.zeros((acts.shape[0], acts.shape[2]))
 
-        bn_grads = np.zeros((acts.shape[0], np.prod(acts.shape[1:])))
-      else:
-        # lose class token
-        bn_grads = np.zeros((acts.shape[0], np.prod(acts[:,1:,:].shape[1:])))
       # get the gradients of the output class w.r.t the activations
       for i in range(len(acts)):
         if self.target_class == 'all':
           class_id = self.discovery_labels[i]
         grads = self._get_gradients(acts[i:i+1], [class_id], bn, example=None)
-        bn_grads[i] = grads.reshape(-1)
+        
+        # Average the gradients across the patch dimension (axis 1) to match the CAV's space.
+        bn_grads[i] = np.mean(grads, 1)
+
       gradients[bn] = bn_grads
     return gradients
 
@@ -953,11 +958,12 @@ class ConceptDiscovery(object):
         new_model_list_vals.append(self.model.norm)
         new_model_list_keys.append('head')
         new_model_list_vals.append(self.model.head)
-      elif self.args.model_to_run == 'vit_b':
+      elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
         new_model_list_keys.append('norm')
         new_model_list_vals.append(self.model.fc_norm)
         new_model_list_keys.append('head')
         new_model_list_vals.append(self.model.head)
+
 
     new_model_list = OrderedDict()
     for k, v in zip(new_model_list_keys, new_model_list_vals):
@@ -997,7 +1003,7 @@ class ConceptDiscovery(object):
       logit_scale = self.model.logit_scale.exp().type(torch.float32)
       outputs = logit_scale * image_features @ self.model.text_features.t()
 
-    elif self.args.model_to_run == 'vit_b':
+    elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
       outputs = cutted_model(inputs).type(torch.float32)[:,0]
     else:
       inputs = inputs.permute(0,3,1,2)
@@ -1018,18 +1024,13 @@ class ConceptDiscovery(object):
   def _return_inter_concept_gradients(self, images, lower_bn, upper_bn, upper_cluster_center):
     # get activations at lower_bn of upper concept patches
     acts = self.get_acts_from_images(images,lower_bn, return_cls_token=True)
-    if not self.args.model_to_run.find('vit') > -1 or self.args.model_to_run == 'mvit':
-      bn_grads = np.zeros((acts.shape[0], np.prod(acts.shape[1:])))
-    else:
-      # gotta lose class token
-      bn_grads = np.zeros((acts.shape[0], np.prod(acts[:,1:,:].shape[1:])))
-
+    bn_grads = np.zeros((acts.shape[0], acts.shape[2]))
 
     # get the gradients of the output class w.r.t the activations
     # get the gradients of the upper concept cluster center w.r.t the activations
     for i in range(len(acts)):
       grads = self._get_inter_gradients(acts[i:i+1], upper_cluster_center, lower_bn, upper_bn, example=None)
-      bn_grads[i] = grads.reshape(-1)
+      bn_grads[i] = np.mean(grads,1)
     gradients = bn_grads
     return gradients
 
@@ -1044,7 +1045,7 @@ class ConceptDiscovery(object):
     if 'mvit' in self.args.model_to_run:
       inputs = inputs.reshape(1, -1, inputs.shape[-1])
       outputs = cutted_model(inputs).type(torch.float32)
-    elif self.args.model_to_run == 'vit_b':
+    elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
       outputs = cutted_model(inputs).type(torch.float32)[:,1:]
     elif self.args.model_to_run == 'clip_vit':
       outputs = cutted_model(inputs).type(torch.float32)[:,1:]
@@ -1226,103 +1227,98 @@ class ConceptDiscovery(object):
       profile = np.mean(profile, -1)
     return profile
 
-
-
   def get_acts_from_images(self, imgs, bottleneck=None, return_cls_token=False):
-    """Run images in the model to get the activations.
-    Args:
-      imgs: a list of images
-      model: a model instance
-      bottleneck_name: bottleneck name to get the activation from
-    Returns:
-      numpy array of activations.
-    """
-    output = {bn: [] for bn in self.bottlenecks}
+    """Run images in the model to get the activations. (Final Corrected Version)"""
+    # This block gets the raw activations from the model's hooks.
+    # It is complex but assumed correct from the original repository.
+    raw_output = {bn: [] for bn in self.bottlenecks}
     if 'clip' in self.args.model_to_run:
-      # if using clip model, need to save GPU space...
       for i in range(imgs.shape[0]):
         img_batch_tensor = torchvision.transforms.functional.normalize(
           torch.tensor(imgs[i]).unsqueeze(0).cuda().permute(0, 3, 1, 2),
           mean=self.mean, std=self.std).float()
-
         _ = self.model.encode_image(img_batch_tensor)
-
         if 'r50' in self.args.model_to_run:
           for i, bn in enumerate(self.bottlenecks):
-            output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
+            raw_output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
             features_blobs.pop(0)
         elif 'vit' in self.args.model_to_run:
           for i, bn in enumerate(self.bottlenecks):
-            if not return_cls_token:
-              output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
-              features_blobs.pop(0)
-              # reset cls token collector since we don't need right meow
-              cls_token_blobs.pop(0)
-            else:
-              # combine features and cls token
-              feature = features_blobs[0]
-              cls_token = cls_token_blobs[0]
-              cls_feat = np.concatenate([np.expand_dims(cls_token, 1),
-                                         feature.reshape(feature.shape[0], feature.shape[1], -1).transpose(0, 2, 1)], 1)
-              output[bn].append(cls_feat)
-              features_blobs.pop(0)
-              cls_token_blobs.pop(0)
-
+            feature, cls_token = features_blobs[0], cls_token_blobs[0]
+            cls_feat = np.concatenate([np.expand_dims(cls_token, 1), feature.reshape(feature.shape[0], feature.shape[1], -1).transpose(0, 2, 1)], 1)
+            raw_output[bn].append(cls_feat)
+            features_blobs.pop(0)
+            cls_token_blobs.pop(0)
       for bn in self.bottlenecks:
-        output[bn] = [np.concatenate(output[bn])]
-    elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+        raw_output[bn] = [np.concatenate(raw_output[bn])]
+    else:
       img_batch_tensor = torchvision.transforms.functional.normalize(
         torch.tensor(imgs).cuda().permute(0, 3, 1, 2),
         mean=self.mean, std=self.std).float()
       _ = self.model(img_batch_tensor)
-
       for i, bn in enumerate(self.bottlenecks):
-        if not return_cls_token:
-          output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
-          features_blobs.pop(0)
-            # reset cls token collector since we don't need right meow
+        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+          feature, cls_token = features_blobs[0], cls_token_blobs[0]
+          cls_feat = np.concatenate([np.expand_dims(cls_token, 1), feature.reshape(feature.shape[0],feature.shape[1],-1).transpose(0,2,1)], 1)
+          raw_output[bn].append(cls_feat)
           cls_token_blobs.pop(0)
         else:
-          # combine features and cls token
-          feature = features_blobs[0]
-          cls_token = cls_token_blobs[0]
-          cls_feat = np.concatenate([np.expand_dims(cls_token, 1), feature.reshape(feature.shape[0],feature.shape[1],-1).transpose(0,2,1)], 1)
-          output[bn].append(cls_feat)
-          features_blobs.pop(0)
-          cls_token_blobs.pop(0)
-    else:
-      img_batch_tensor = torchvision.transforms.functional.normalize(
-        torch.tensor(imgs).cuda().permute(0, 3, 1, 2),
-        mean=self.mean, std=self.std).float()
-      _ = self.model(img_batch_tensor)
-
-      for i, bn in enumerate(self.bottlenecks):
-        output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
+          raw_output[bn].append(features_blobs[0].transpose(0, 2, 3, 1))
         features_blobs.pop(0)
 
-    if bottleneck is None:
-      return output[0]
-    else:
-      return output[bottleneck][0]
+    # This is the processing block that contains the definitive fix.
+    final_output = raw_output[bottleneck][0]
 
+    # If the caller needs the raw 3D tensor with the CLS token, return it now.
+    if return_cls_token:
+      return final_output
 
+    # Otherwise, process the activations into a clean 2D array for CAV/clustering.
+    processed_acts = final_output
+    # Step 1: If it's a ViT model, strip the CLS token.
+    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+      if processed_acts.ndim == 3:
+        processed_acts = processed_acts[:, 1:, :]
+
+    # Step 2: Average over all remaining spatial/patch dimensions.
+    if self.channel_mean and processed_acts.ndim > 2:
+      return np.mean(processed_acts, axis=tuple(range(1, processed_acts.ndim - 1)))
+    else: # Or flatten if not averaging, or if already 2D
+      return np.reshape(processed_acts, [processed_acts.shape[0], -1])
 
 # hooks for all models
 cls_token_blobs = []
 features_blobs = []
 def hook_feature(module, input, output):
-  # if vit, grab tensor and reshape to b x h x w x c
-  if output.shape[0] == 50 and len(output.shape) == 3:
-    output = output.permute(1, 0, 2)
+  """This hook robustly handles both CNN and Vision Transformer outputs."""  
+  # Check if the output is a 3D tensor, characteristic of a ViT block.
   if len(output.shape) == 3:
-    size = int(np.sqrt(output.shape[1]))
-    try:
-      output = output.reshape(output.shape[0], size, size, -1).permute(0,3,1,2)
-    except:
-      cls_token_blobs.append(output[:,0,:].data.cpu().numpy())
-      output = output[:,1:,:].reshape(output.shape[0], size, size, -1).permute(0, 3, 1, 2)
+    # The first token is ALWAYS the CLS token.
+    cls_token = output[:, 0, :].data.cpu().numpy()
+    cls_token_blobs.append(cls_token)
 
-  features_blobs.append(output.data.cpu().numpy())
+    # The rest are the patch embeddings.
+    patch_tokens = output[:, 1:, :]
+    
+    # Determine the HxW shape of the patch grid.
+    num_patches = patch_tokens.shape[1]
+    size = int(np.sqrt(num_patches))
+    if size * size != num_patches:
+      raise ValueError(f"Cannot form a square grid from {num_patches} patches.")
+      
+    # Reshape to (batch, height, width, channels)
+    reshaped_output = patch_tokens.reshape(
+        patch_tokens.shape[0], size, size, -1
+    )
+      
+    # Permute to the PyTorch standard: (batch, channels, height, width)
+    permuted_output = reshaped_output.permute(0, 3, 1, 2)
+    features_blobs.append(permuted_output.data.cpu().numpy())
+
+  # If not 3D, it's a standard CNN feature map (already B, C, H, W).
+  else:
+    features_blobs.append(output.data.cpu().numpy())
+
 
 def hook_feature_mvit(module, input, output):
   if len(output.shape) == 3:
@@ -1379,6 +1375,25 @@ def make_model(settings, hook=True):
     model = timm.create_model('mnasnet_a1', pretrained=settings.pretrained)
   elif settings.model_to_run == 'vit_b':
     model = timm.create_model('vit_base_patch32_224', pretrained=settings.pretrained)
+  elif settings.model_to_run == 'vit_b16':
+    model = timm.create_model('vit_base_patch16_224', pretrained=settings.pretrained)
+  elif settings.model_to_run == 'huge_vit':
+    model = timm.create_model('vit_huge_patch14_224', pretrained=settings.pretrained)
+   # weights_path = ''
+   # timm.models.load_checkpoint(model, weights_path)
+  elif settings.model_to_run == 'tiny_vit':
+    print("--- INFO: Manually loading vit_tiny_patch16_224 in offline mode. ---")
+    # Step 1: Create the model architecture ONLY.
+    model = timm.create_model('vit_tiny_patch16_224', pretrained=False)
+
+    # Step 2: Define the exact path to the pre-downloaded weights file.
+    # We know this is in our cache from the 'ls' command you ran.
+    weights_path = '/home/mauricio.alvarez/tesis/VCC/model_cache/hub/checkpoints/Ti_16-i21k-300ep-lr_0.001-aug_none-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz'
+
+    # Step 3: Manually load the weights from the file into the model.
+    # This function is part of the timm library and handles loading correctly.
+    timm.models.load_checkpoint(model, weights_path)
+    print("--- INFO: Manual weight loading complete. ---")
   elif settings.model_to_run == 'inception_v3':
     model = timm.create_model('inception_v3', pretrained=settings.pretrained)
   elif settings.model_to_run == 'tf_mobilenetv3_large_075':
