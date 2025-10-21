@@ -1379,8 +1379,10 @@ def make_model(settings, hook=True):
     model = timm.create_model('vit_base_patch16_224', pretrained=settings.pretrained)
   elif settings.model_to_run == 'huge_vit':
     model = timm.create_model('vit_huge_patch14_224', pretrained=settings.pretrained)
-   # weights_path = ''
-   # timm.models.load_checkpoint(model, weights_path)
+  elif settings.model_to_run == 'large_vit':
+      model = timm.create_model('vit_large_patch16_224',pretrained=False)
+      weights_path = '/home/mauricio.alvarez/tesis/VCC/model_cache/hub/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_224.npz'
+      timm.models.load_checkpoint(model, weights_path)
   elif settings.model_to_run == 'tiny_vit':
     print("--- INFO: Manually loading vit_tiny_patch16_224 in offline mode. ---")
     # Step 1: Create the model architecture ONLY.
