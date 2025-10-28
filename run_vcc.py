@@ -241,6 +241,14 @@ def parse_arguments(argv):
 
     # Parallelization
     parser.add_argument('--cluster_parallel_workers', type=int,help="Number of parallel jobs for clustering.", default=8)
+    parser.add_argument('--model_to_run', type=str,
+        help='The name of the pytorch model as in torch hub.', default='vgg11')
+
+    # <<< --- ADD THESE TWO NEW ARGUMENTS --- >>>
+    parser.add_argument('--target_layer', type=int, default=None,
+                        help='The specific layer index to hook (e.g., 17).')
+    parser.add_argument('--target_submodule', type=str, default=None,
+                        help="The specific submodule to hook within the target layer (e.g., 'attn' or 'mlp').")
 
     return parser.parse_args(argv)
 
