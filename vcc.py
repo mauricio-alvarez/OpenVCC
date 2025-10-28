@@ -1447,24 +1447,21 @@ def make_model(settings, hook=True):
     else:
       model = checkpoint
   if hook:
-    if hasattr(settings, 'target_layer') and settings.target_layer is not None:
-      target_layer_index = int(settings.target_layer)
-      if hasattr(settings, 'target_submodule') and settings.target_submodule:
+    target_layer_val = getattr(settings, 'target_layer', None)
+    target_submodule_val = getattr(settings, 'target_submodule', None)
+
+    if target_layer_val is not None:
+      target_layer_index = int(target_layer_val)
+        
+      if target_submodule_val:
+        # We are targeting a submodule (e.g., 'attn')
         try:
           layer = model.blocks[target_layer_index]
-          submodule = getattr(layer, settings.target_submodule)
+          submodule = getattr(layer, target_submodule_val)
           submodule.register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked submodule '{settings.target_submodule}' of layer '{target_layer_index}' ---")
+          print(f"--- Successfully hooked submodule '{target_submodule_val}' of layer '{target_layer_index}' ---")
         except (AttributeError, IndexError) as e:
-          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{settings.target_submodule}'.")
-          raise e
-      else:
-        # Original logic: target the whole block
-        try:
-          model.blocks[target_layer_index].register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked entire block of layer '{target_layer_index}' ---")
-        except (AttributeError, IndexError) as e:
-          print(f"ERROR: Could not find layer '{target_layer_index}'.")
+          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{target_submodule_val}'.")
           raise e
     else:
       for name in settings.feature_names:
