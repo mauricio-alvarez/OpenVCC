@@ -1447,48 +1447,69 @@ def make_model(settings, hook=True):
     else:
       model = checkpoint
   if hook:
-    for name in settings.feature_names:
-      if settings.model_to_run == 'alexnet':
-        model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-      elif settings.model_to_run == 'mobilenet_v2' or settings.model_to_run == 'efficientnet_b4' or settings.model_to_run == 'mnasnet_a1' or settings.model_to_run == 'tf_mobilenetv3_large_075':
-        # model._modules['features']._modules.get(name).register_forward_hook(hook_feature) # toch hub
-        if '.' in name:
-          module_name = name.split('.')[0]
-          layer_name = name.split('.')[1]
-          model._modules['blocks']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-        else:
-          model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature) # timm
-      elif 'vgg' in settings.model_to_run:
-        model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-      elif settings.model_to_run == 'clip_r50':
-        if '.' in name:
-          module_name = name.split('.')[0]
-          layer_name = name.split('.')[1]
-          # model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-          model._modules['visual']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-        else:
-          model._modules['visual']._modules.get(name).register_forward_hook(hook_feature)
-      elif settings.model_to_run == 'clip_vit':
-        model._modules['visual']._modules['transformer']._modules['resblocks']._modules.get(name).register_forward_hook(hook_feature)
-      elif settings.model_to_run == 'mvit':
-        model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature_mvit)
-      elif settings.model_to_run.find('vit') > -1:
-        model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature)
-      elif settings.model_to_run.find('cub') > -1:
-        model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-
-      # for name, module in self.model.named_modules():
+    if hasattr(settings, 'target_layer') and settings.target_layer is not None:
+      target_layer_index = int(settings.target_layer)
+      if hasattr(settings, 'target_submodule') and settings.target_submodule:
+        try:
+          layer = model.blocks[target_layer_index]
+          submodule = getattr(layer, settings.target_submodule)
+          submodule.register_forward_hook(hook_feature)
+          print(f"--- Successfully hooked submodule '{settings.target_submodule}' of layer '{target_layer_index}' ---")
+        except (AttributeError, IndexError) as e:
+          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{settings.target_submodule}'.")
+          raise e
       else:
-        if '.' in name:
-          if len(name.split('.')) == 2:
+        # Original logic: target the whole block
+        try:
+          model.blocks[target_layer_index].register_forward_hook(hook_feature)
+          print(f"--- Successfully hooked entire block of layer '{target_layer_index}' ---")
+        except (AttributeError, IndexError) as e:
+          print(f"ERROR: Could not find layer '{target_layer_index}'.")
+          raise e
+    else:
+      for name in settings.feature_names:
+        if settings.model_to_run == 'alexnet':
+          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
+        elif settings.model_to_run == 'mobilenet_v2' or settings.model_to_run == 'efficientnet_b4' or settings.model_to_run == 'mnasnet_a1' or settings.model_to_run == 'tf_mobilenetv3_large_075':
+          # model._modules['features']._modules.get(name).register_forward_hook(hook_feature) # toch hub
+          if '.' in name:
             module_name = name.split('.')[0]
             layer_name = name.split('.')[1]
-            model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-          elif len(name.split('.')) == 3:
-            model._modules.get(name.split('.')[0])._modules.get(name.split('.')[1])._modules.get(name.split('.')[2]).register_forward_hook(hook_feature)
+            model._modules['blocks']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
+          else:
+            model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature) # timm
+        elif 'vgg' in settings.model_to_run:
+          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
+        elif settings.model_to_run == 'clip_r50':
+          if '.' in name:
+            module_name = name.split('.')[0]
+            layer_name = name.split('.')[1]
+            # model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
+            model._modules['visual']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
+          else:
+            model._modules['visual']._modules.get(name).register_forward_hook(hook_feature)
+        elif settings.model_to_run == 'clip_vit':
+          model._modules['visual']._modules['transformer']._modules['resblocks']._modules.get(name).register_forward_hook(hook_feature)
+        elif settings.model_to_run == 'mvit':
+          model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature_mvit)
+        elif settings.model_to_run.find('vit') > -1:
+          model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature)
+        elif settings.model_to_run.find('cub') > -1:
+          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
+  
+        # for name, module in self.model.named_modules():
         else:
-          model._modules.get(name).register_forward_hook(hook_feature)
-    model.cuda()
+          if '.' in name:
+            if len(name.split('.')) == 2:
+              module_name = name.split('.')[0]
+              layer_name = name.split('.')[1]
+              model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
+            elif len(name.split('.')) == 3:
+              model._modules.get(name.split('.')[0])._modules.get(name.split('.')[1])._modules.get(name.split('.')[2]).register_forward_hook(hook_feature)
+          else:
+            model._modules.get(name).register_forward_hook(hook_feature)
+      model.cuda()
+  
   else:
     model.cuda()
   model.eval()
