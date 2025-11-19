@@ -1020,11 +1020,16 @@ class ConceptDiscovery(object):
     inputs = torch.autograd.Variable(torch.tensor(acts).cuda(), requires_grad=True)
     if self.args.model_to_run == 'shvit':
       cutted_model = self._get_cutted_model_shvit(bottleneck_name).cuda()   
-    cutted_model = self._get_cutted_model(bottleneck_name).cuda()
+    else:
+      cutted_model = self._get_cutted_model(bottleneck_name).cuda()
     cutted_model.eval()
     cutted_model.zero_grad()
 
-    if 'mvit' in self.args.model_to_run:
+    if 'shvit' in self.args.model_to_run:
+      # SHViT expects (B, C, H, W). The input 'acts' is (B, H, W, C). We must permute.
+      permuted_inputs = inputs.permute(0, 3, 1, 2)
+      outputs = cutted_model(permuted_inputs).type(torch.float32)
+    elif 'mvit' in self.args.model_to_run:
       inputs = inputs.reshape(1, -1, inputs.shape[-1])
       outputs = cutted_model(inputs).type(torch.float32)
     elif 'clip' in self.args.model_to_run:
@@ -1032,27 +1037,6 @@ class ConceptDiscovery(object):
         image_features = cutted_model(inputs.permute(0,3,1,2)).type(torch.float32)
       elif 'vit' in self.args.model_to_run:
         image_features = cutted_model(inputs.permute(1,0,2))
-        image_features = image_features.permute(1,0,2)
-        image_features = self.model.visual.ln_post(image_features[:, 0, :])
-        image_features = image_features @ self.model.visual.proj
-
-      # normalized features
-      image_features = (image_features / image_features.norm(dim=-1, keepdim=True)).type(torch.float32)
-
-      # cosine similarity as logits
-      logit_scale = self.model.logit_scale.exp().type(torch.float32)
-      outputs = logit_scale * image_features @ self.model.text_features.t()
-
-    elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
-      outputs = cutted_model(inputs).type(torch.float32)[:,0]
-    else:
-      inputs = inputs.permute(0,3,1,2)
-      outputs = cutted_model(inputs).type(torch.float32)
-
-    grads = torch.autograd.grad(outputs[:, y[0]].sum(), inputs)[0]
-
-    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
-      grads = grads[:,1:,:]
         image_features = image_features.permute(1,0,2)
         image_features = self.model.visual.ln_post(image_features[:, 0, :])
         image_features = image_features @ self.model.visual.proj
@@ -1103,7 +1087,10 @@ class ConceptDiscovery(object):
     cutted_model = self._get_cutted_model(lower_bn, upper_bn).cuda()
     cutted_model.eval()
 
-    if 'mvit' in self.args.model_to_run:
+    if 'shvit' in self.args.model_to_run:
+      permuted_inputs = inputs.permute(0, 3, 1, 2)
+      outputs = cutted_model(permuted_inputs).type(torch.float32)
+    elif 'mvit' in self.args.model_to_run:
       inputs = inputs.reshape(1, -1, inputs.shape[-1])
       outputs = cutted_model(inputs).type(torch.float32)
     elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
