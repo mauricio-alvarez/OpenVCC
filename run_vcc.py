@@ -63,10 +63,19 @@ def main(args):
     # if using imagenet, then use the path to entire imagenet dataset
     mymodel = make_model(args)
     # if args.target_dataset == 'imagenet' and len(args.imagenet_path) > 0:
-    for key, val in mymodel.class_idx.items():
+    if args.target_dataset == 'custom':
+      print("--- Using custom dataset logic: class_dir = target_class ---")
+      class_dir = args.target_class
+    else:
+      # Original logic for ImageNet lookup.
+      for key, val in mymodel.class_idx.items():
+        print("This value sis being compared with target class ",val)
         if val[1] == args.target_class:
-            class_dir = val[0]
+          class_dir = val[0]
+          break # Exit the loop once found
+    
     source_dir = '{}/{}'.format(args.imagenet_path, class_dir)
+
 
     cd = ConceptDiscovery(
       args,
@@ -241,14 +250,12 @@ def parse_arguments(argv):
 
     # Parallelization
     parser.add_argument('--cluster_parallel_workers', type=int,help="Number of parallel jobs for clustering.", default=8)
-    parser.add_argument('--model_to_run', type=str,
-        help='The name of the pytorch model as in torch hub.', default='vgg11')
-
-    # <<< --- ADD THESE TWO NEW ARGUMENTS --- >>>
     parser.add_argument('--target_layer', type=int, default=None,
                         help='The specific layer index to hook (e.g., 17).')
     parser.add_argument('--target_submodule', type=str, default=None,
                         help="The specific submodule to hook within the target layer (e.g., 'attn' or 'mlp').")
+    parser.add_argument('--num_classes', type=int, default=1000,
+                        help="Number of classes for the model's classifier head.")
 
     return parser.parse_args(argv)
 

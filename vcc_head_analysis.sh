@@ -4,14 +4,14 @@
 # Slurm Directives
 #----------------------------------------------------------------#
 #SBATCH -J vcc_submodule      # Job name
-#SBATCH -p gpu
+#SBATCH --partition=gpu
 #SBATCH -c 4
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:rtxa6000:1
 #SBATCH -o logs/submodule_%A_%a.log  # Save logs in a 'logs' directory
 #SBATCH -e logs/submodule_%A_%a.err  # %A is job ID, %a is task ID
+#SBATCH --account=investigacion1
 
-# --- THIS IS THE JOB ARRAY DIRECTIVE ---
 # We will run 8 experiments (4 layers x 2 submodules)
 #SBATCH --array=0-7
 
@@ -43,17 +43,17 @@ echo "----------------------------------------"
 # Environment and Execution
 #----------------------------------------------------------------#
 module load miniconda/3.0
-source activate VCC_final
+conda activate VCC_final
 
 export TORCH_HOME="/home/mauricio.alvarez/tesis/VCC/model_cache"
 export HF_HOME="/home/mauricio.alvarez/tesis/VCC/model_cache"
 export HF_HUB_OFFLINE=1
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 
 cd "/home/mauricio.alvarez/tesis/VCC" || exit 1
 
 # Define a unique working directory for each job
-WORKING_DIR="outputs/large_vit_sports_car_L${LAYER_TO_RUN}_${SUBMODULE_TO_RUN}"
+WORKING_DIR="outputs/4v_large_vit_sports_car_L${LAYER_TO_RUN}_${SUBMODULE_TO_RUN}"
 
 python run_vcc.py \
     --working_dir "$WORKING_DIR" \

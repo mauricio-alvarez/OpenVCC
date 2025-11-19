@@ -17,6 +17,9 @@ import models.clip as clip
 from tqdm import tqdm
 from threadpoolctl import threadpool_limits
 import matplotlib.pyplot as plt
+import torch.nn as nn
+from train_model import set_seed, build_shvit
+
 class ConceptDiscovery(object):
   def __init__(self,
                args,
@@ -191,7 +194,7 @@ class ConceptDiscovery(object):
         out = features_blobs[0].transpose(0,2,3,1)
         output[bn].append(out)
         features_blobs.pop(0)
-        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
           # reset cls token collector since we don't need right meow
           cls_token_blobs.pop(0)
 
@@ -446,7 +449,7 @@ class ConceptDiscovery(object):
       for i, bn in enumerate(self.bottlenecks):
         output[bn].append(features_blobs[0].transpose(0,2,3,1))
         features_blobs.pop(0)
-        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
           # reset cls token collector since we don't need right meow
           cls_token_blobs.pop(0)
 
@@ -645,6 +648,12 @@ class ConceptDiscovery(object):
           mildly_populated_concept = len(concept_image_numbers) > 0.25 * discovery_size
           highly_populated_concept = len(concept_image_numbers) > 0.5 * discovery_size
 
+          highly_common_concept = len(concept_image_numbers) > 0.1 * label_len
+          mildly_common_concept = len(concept_image_numbers) > 0.05 * label_len
+          non_common_concept = len(concept_image_numbers) > 0.01 * label_len
+          mildly_populated_concept = len(concept_image_numbers) > 0.05 * discovery_size
+          highly_populated_concept = len(concept_image_numbers) > 0.1 * discovery_size
+
           cond2 = mildly_populated_concept and mildly_common_concept
           cond3 = non_common_concept and highly_populated_concept
 
@@ -663,6 +672,16 @@ class ConceptDiscovery(object):
       bn_dic.pop('label', None)
       bn_dic.pop('cost', None)
       self.dic[bn] = bn_dic
+      all_centers = []
+      for concept_name in bn_dic['concepts']:
+          center_key = concept_name + '_center'
+          if center_key in bn_dic:
+              all_centers.append(bn_dic[center_key])
+
+      if all_centers:
+          centers_path = os.path.join(self.args.working_dir, f'centers_{bn}.npy')
+          np.save(centers_path, np.array(all_centers))
+          print(f"--- Saved {len(all_centers)} concept centers to {centers_path} ---")
 
   def _random_concept_activations(self, bottleneck, random_concept):
     """Wrapper for computing or loading activations of random concepts.
@@ -829,20 +848,57 @@ class ConceptDiscovery(object):
         class_id = self.model.label_to_id[self.target_class.lower()]
     for bn in self.bottlenecks:
       acts = self.get_acts_from_images(images,bn, return_cls_token=True)
-      
-      bn_grads = np.zeros((acts.shape[0], acts.shape[2]))
+      num_features = acts.shape[-1]
+      bn_grads = np.zeros((acts.shape[0], num_features))
 
       # get the gradients of the output class w.r.t the activations
       for i in range(len(acts)):
         if self.target_class == 'all':
           class_id = self.discovery_labels[i]
         grads = self._get_gradients(acts[i:i+1], [class_id], bn, example=None)
+        reshaped_grads = grads.reshape(grads.shape[0], -1, num_features)
         
         # Average the gradients across the patch dimension (axis 1) to match the CAV's space.
-        bn_grads[i] = np.mean(grads, 1)
+        bn_grads[i] = np.mean(reshaped_grads, axis=1)
 
       gradients[bn] = bn_grads
     return gradients
+
+  def _get_cutted_model_shvit(self, bottleneck_name):
+    """Creates a partial SHViT model starting from AFTER the bottleneck stage."""
+    cutted_model_list = OrderedDict()
+    stage_num = int(bottleneck_name)
+
+    # Add subsequent stages to the new model
+    if stage_num < 2:
+        cutted_model_list['blocks2'] = self.model.blocks2
+    if stage_num < 3:
+        cutted_model_list['blocks3'] = self.model.blocks3
+    
+    # Add the final classification layers
+    cutted_model_list['pool'] = torch.nn.AdaptiveAvgPool2d(1)
+    cutted_model_list['flatten'] = torch.nn.Flatten(1)
+    cutted_model_list['head'] = self.model.head
+
+    return torch.nn.Sequential(cutted_model_list)
+
+  def _get_cutted_model(self, bottleneck, upper_bottleneck=None):
+    # get layers only after bottleneck
+    new_model_list_keys = []
+    new_model_list_vals = []
+    add_to_list = False
+
+    # construct layer generator
+    if 'vgg' in self.args.model_to_run or self.args.model_to_run == 'alexnet' or self.args.model_to_run == 'resnet18_cub':
+      layer_generator = self.model.features.named_children()
+    elif self.args.model_to_run == 'clip_r50':
+      if '.' in bottleneck:
+    # Add the final classification layers
+    cutted_model_list['pool'] = torch.nn.AdaptiveAvgPool2d(1)
+    cutted_model_list['flatten'] = torch.nn.Flatten(1)
+    cutted_model_list['head'] = self.model.head
+
+    return torch.nn.Sequential(cutted_model_list)
 
   def _get_cutted_model(self, bottleneck, upper_bottleneck=None):
     # get layers only after bottleneck
@@ -915,24 +971,6 @@ class ConceptDiscovery(object):
         add_to_list = True
 
     # add final layers to model
-    if upper_bottleneck is None:
-      if 'vgg' in self.args.model_to_run or self.args.model_to_run == 'tf_mobilenetv3_large_075':
-        if self.args.model_to_run == 'tf_mobilenetv3_large_075':
-          new_model_list_keys.append('global_pool')
-          new_model_list_vals.append(self.model.global_pool)
-          new_model_list_keys.append('conv_head')
-          new_model_list_vals.append(self.model.conv_head)
-          new_model_list_keys.append('act2')
-          new_model_list_vals.append(self.model.act2)
-          new_model_list_keys.append('flatten')
-          new_model_list_vals.append(torch.nn.Flatten())
-          new_model_list_keys.append('classifier')
-          new_model_list_vals.append(self.model.classifier)
-        elif 'vgg' in self.args.model_to_run:
-          if 'sin' in self.args.model_to_run:
-            new_model_list_keys.append('flatten')
-            new_model_list_vals.append(torch.nn.Flatten())
-            new_model_list_keys.append('classifier')
             new_model_list_vals.append(self.model.classifier)
           else:
             new_model_list_keys.append('pre_logits')
@@ -980,6 +1018,8 @@ class ConceptDiscovery(object):
   def _get_gradients(self, acts, y, bottleneck_name, example=None):
     # TCAV method gradients
     inputs = torch.autograd.Variable(torch.tensor(acts).cuda(), requires_grad=True)
+    if self.args.model_to_run == 'shvit':
+      cutted_model = self._get_cutted_model_shvit(bottleneck_name).cuda()   
     cutted_model = self._get_cutted_model(bottleneck_name).cuda()
     cutted_model.eval()
     cutted_model.zero_grad()
@@ -1009,9 +1049,30 @@ class ConceptDiscovery(object):
       inputs = inputs.permute(0,3,1,2)
       outputs = cutted_model(inputs).type(torch.float32)
 
-    grads = torch.autograd.grad(outputs[:, y[0]], inputs)[0]
+    grads = torch.autograd.grad(outputs[:, y[0]].sum(), inputs)[0]
 
-    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
+      grads = grads[:,1:,:]
+        image_features = image_features.permute(1,0,2)
+        image_features = self.model.visual.ln_post(image_features[:, 0, :])
+        image_features = image_features @ self.model.visual.proj
+
+      # normalized features
+      image_features = (image_features / image_features.norm(dim=-1, keepdim=True)).type(torch.float32)
+
+      # cosine similarity as logits
+      logit_scale = self.model.logit_scale.exp().type(torch.float32)
+      outputs = logit_scale * image_features @ self.model.text_features.t()
+
+    elif self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+      outputs = cutted_model(inputs).type(torch.float32)[:,0]
+    else:
+      inputs = inputs.permute(0,3,1,2)
+      outputs = cutted_model(inputs).type(torch.float32)
+
+    grads = torch.autograd.grad(outputs[:, y[0]].sum(), inputs)[0]
+
+    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
       grads = grads[:,1:,:]
     grads = grads.detach().cpu().numpy()
 
@@ -1068,7 +1129,7 @@ class ConceptDiscovery(object):
     grads = -torch.autograd.grad(outputs=outputs, inputs=inputs)[0]
 
     # if vit, remove class token
-    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+    if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
       grads = grads[:,1:,:]
     grads = grads.detach().cpu().numpy()
     gc.collect()
@@ -1257,7 +1318,7 @@ class ConceptDiscovery(object):
         mean=self.mean, std=self.std).float()
       _ = self.model(img_batch_tensor)
       for i, bn in enumerate(self.bottlenecks):
-        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit':
+        if self.args.model_to_run.find('vit') > -1 and not self.args.model_to_run == 'mvit' and self.args.model_to_run != 'shvit':
           feature, cls_token = features_blobs[0], cls_token_blobs[0]
           cls_feat = np.concatenate([np.expand_dims(cls_token, 1), feature.reshape(feature.shape[0],feature.shape[1],-1).transpose(0,2,1)], 1)
           raw_output[bn].append(cls_feat)
@@ -1379,7 +1440,12 @@ def make_model(settings, hook=True):
     model = timm.create_model('vit_base_patch16_224', pretrained=settings.pretrained)
   elif settings.model_to_run == 'huge_vit':
     model = timm.create_model('vit_huge_patch14_224', pretrained=settings.pretrained)
-  elif settings.model_to_run == 'large_vit':
+  elif settings.model_to_run == 'shvit':
+    num_classes= 1000
+    model_path = '/home/mauricio.alvarez/tesis/VCC/model_weights/SHViT/shvit_s1.pth'
+    model = build_shvit('s1', model_path, num_classes)
+    print("SHViT loaded: ", model)
+  elif settings.model_to_run == 'vit_large':
       model = timm.create_model('vit_large_patch16_224',pretrained=False)
       weights_path = '/home/mauricio.alvarez/tesis/VCC/model_cache/hub/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_224.npz'
       timm.models.load_checkpoint(model, weights_path)
@@ -1427,6 +1493,15 @@ def make_model(settings, hook=True):
     checkpoint = torch.load(filepath)
     model.load_state_dict(checkpoint["state_dict"])
     model.features = model.features.module
+  
+  elif settings.model_to_run == 'custom':
+    # Change this to accept other models
+    model = timm.create_model('vit_large_patch16_224', pretrained=False, num_classes=1000)
+    in_features = model.head.in_features
+    model.head = nn.Linear(in_features, 16)
+    checkpoint = torch.load(settings.model_path, map_location='cuda')
+    model.load_state_dict(checkpoint)
+
   else:
     checkpoint = torch.load(settings.model_path)
     if type(checkpoint).__name__ == 'OrderedDict' or type(checkpoint).__name__ == 'dict':
@@ -1446,17 +1521,32 @@ def make_model(settings, hook=True):
       model.load_state_dict(state_dict, strict=True)
     else:
       model = checkpoint
+
   if hook:
-    if hasattr(settings, 'target_layer') and settings.target_layer is not None:
-      target_layer_index = int(settings.target_layer)
-      if hasattr(settings, 'target_submodule') and settings.target_submodule:
+    target_layer_val = getattr(settings, 'target_layer', None)
+    target_submodule_val = getattr(settings, 'target_submodule', None)
+
+    if target_layer_val is not None:
+      target_layer_index = int(target_layer_val)
+      if 'shvit' in settings.model_to_run:
+        try:
+          target_block_name = f'blocks{target_layer_index}'
+          target_module = getattr(model, target_block_name)
+          target_module.register_forward_hook(hook_feature)
+          print(f"--- Successfully hooked SHViT stage '{target_block_name}' ---")
+        except (AttributeError, IndexError) as e:
+          print(f"Fatal Error: Could not find SHViT stage '{target_block_name}'---")
+          raise e
+
+      elif target_submodule_val:
+        # We are targeting a submodule (e.g., 'attn')
         try:
           layer = model.blocks[target_layer_index]
-          submodule = getattr(layer, settings.target_submodule)
+          submodule = getattr(layer, target_submodule_val)
           submodule.register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked submodule '{settings.target_submodule}' of layer '{target_layer_index}' ---")
+          print(f"--- Successfully hooked submodule '{target_submodule_val}' of layer '{target_layer_index}' ---")
         except (AttributeError, IndexError) as e:
-          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{settings.target_submodule}'.")
+          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{target_submodule_val}'.")
           raise e
       else:
         # Original logic: target the whole block
@@ -1466,7 +1556,7 @@ def make_model(settings, hook=True):
         except (AttributeError, IndexError) as e:
           print(f"ERROR: Could not find layer '{target_layer_index}'.")
           raise e
-    else:
+    else:        
       for name in settings.feature_names:
         if settings.model_to_run == 'alexnet':
           model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
@@ -1510,35 +1600,21 @@ def make_model(settings, hook=True):
             model._modules.get(name).register_forward_hook(hook_feature)
       model.cuda()
   
-  else:
-    model.cuda()
+  model.cuda()
   model.eval()
   if settings.target_dataset == 'toy1':
     model.label_to_id = {'00': 0,'10': 1,'20': 2,'01': 3,'11': 4,'21': 5,'02': 6,'12': 7,'22': 8}
   elif settings.target_dataset == 'toy2' or settings.target_dataset == 'toy3':
     model.label_to_id = {
-            '0000': 0,
-            '1000': 1,
-            '0100': 2,
-            '0010': 3,
-            '0001': 4,
-            '1100': 5,
-            '1010': 6,
-            '1001': 7,
-            '0110': 8,
-            '0101': 9,
-            '0011': 10,
-            '1110': 11,
-            '1101': 12,
-            '1011': 13,
-            '0111': 14,
-            '1111': 15,
-        }
-  elif settings.target_dataset == 'cub':
-    classes = [cls.split('/')[-1].lower() for cls in glob.glob(settings.cub_path + '/*')]
-    model.labels = [x.split('.')[1].lower() for x in classes]
-    model.label_to_id = {v: k for (k, v) in enumerate(model.labels)}
     model.class_idx = {k: v for (k, v) in enumerate(model.labels)}
+
+  elif settings.target_dataset == 'custom':
+    class_names = sorted([d.name for d in os.scandir(settings.imagenet_path) if d.is_dir()])
+    model.labels = [name.replace('_', ' ') for name in class_names]
+    model.label_to_id = {label: i for i, label in enumerate(model.labels)}
+    # Create a class_idx-like structure for compatibility
+    model.class_idx = {str(i): [class_names[i], model.labels[i]] for i in range(len(class_names))}
+    print(f"--- Found {len(class_names)} classes. ---")
   else:
     with open(settings.labels_path, 'r') as f:
       class_idx = json.load(f)

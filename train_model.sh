@@ -18,7 +18,7 @@ echo "Job started on $(hostname) at $(date)"
 echo "Loading required modules..."
 
 module load miniconda/3.0
-conda activate VCC_final # <<< --- FIX: Using 'conda activate' which works on your system
+conda activate shvit # <<< --- FIX: Using 'conda activate' which works on your system
 echo "Environment is ready."
 
 #----------------------------------------------------------------#
@@ -35,11 +35,7 @@ cd "/home/mauricio.alvarez/tesis/VCC" || exit 1
 echo "Starting image decomposition..."
 
 # Use the full path with $HOME instead of ~ for better reliability in scripts
-python image_decomposition.py \
-    --image_path "$HOME/tesis/archive/session-1/car/0315_sty_dnn_0_car_00_car-0032-ILSVRC2012-val-00030834.png" \
-    --model_to_run "vit_b" \
-    --feature_names 4 5 8 11\
-    --output_dir "outputs/decomposition_base"
+python main.py 
 
 echo "Python script finished."
 
@@ -49,3 +45,4 @@ echo "Python script finished."
 conda deactivate
 module unload miniconda/3.0
 echo "Job finished at $(date)"
+
