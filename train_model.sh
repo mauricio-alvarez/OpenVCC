@@ -18,7 +18,7 @@ echo "Job started on $(hostname) at $(date)"
 echo "Loading required modules..."
 
 module load miniconda/3.0
-conda activate shvit # <<< --- FIX: Using 'conda activate' which works on your system
+conda activate VCC_final 
 echo "Environment is ready."
 
 #----------------------------------------------------------------#

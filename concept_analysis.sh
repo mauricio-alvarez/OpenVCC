@@ -15,7 +15,7 @@ CLASSES=(elephant)
 CLASS_TO_RUN=${CLASSES[$SLURM_ARRAY_TASK_ID]}
 
 # IMPORTANT: Specify the layer you want to analyze
-LAYER_TO_RUN=16 
+LAYER_TO_RUN=11 
 
 echo "--- Starting Data Generation for Stylized ImageNet ---"
 echo "Model Path: YOUR_MODEL_PATH.pth, Class: $CLASS_TO_RUN, Layer: $LAYER_TO_RUN"
@@ -33,7 +33,7 @@ python run_vcc.py \
     --working_dir "$WORKING_DIR" \
     --target_class "$CLASS_TO_RUN" \
     --model_to_run "custom" \
-    --model_path "/home/mauricio.alvarez/tesis/VCC/model_weights/ViT-L_head_only_best_finetuned.pth" \
+    --model_path "/home/mauricio.alvarez/tesis/VCC/model_weights/tiny_stylized_22acc.pth" \
     --feature_names "$LAYER_TO_RUN" \
     --target_layer "$LAYER_TO_RUN" \
     --target_dataset "custom" \

@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, Dataset
+from sklearn.model_selection import train_test_split
 from torchvision import datasets, transforms
 import timm
 from tqdm import tqdm
@@ -11,6 +12,21 @@ import random
 import numpy as np
 from SHViT import BN_Linear, shvit_s1, shvit_s2, shvit_s3, shvit_s4
 import torchvision
+
+class ApplyTransform(Dataset):
+  def __init__(self, subset, transform=None):
+    self.subset = subset
+    self.transform = transform
+
+  def __getitem__(self, index):
+    x, y = self.subset[index]
+    if self.transform:
+      x = self.transform(x)
+    return x, y
+
+  def __len__(self):
+    return len(self.subset)
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -48,18 +64,26 @@ def get_imagenet_labels():
 
 def build_shvit(shvit_name, location, classes_output=1000):
     if shvit_name == 's1':
-        shvit = shvit_s1(num_classes=1000)
+      shvit = shvit_s1(num_classes=16)
     elif shvit_name == 's2':
-        shvit = shvit_s2(num_classes=1000)
+      shvit = shvit_s2(num_classes=1000)
     elif shvit_name == 's3':
-        shvit = shvit_s3(num_classes=1000)
+      shvit = shvit_s3(num_classes=1000)
     elif shvit_name == 's4':
-        shvit = shvit_s4(num_classes=1000)
+      shvit = shvit_s4(num_classes=1000)
     else:
-        print("ADD A VALID MODEL NAME: [s1,s2,s3,s4] ")
-        return
+      print("ADD A VALID MODEL NAME: [s1,s2,s3,s4] ")
+      return
     checkpoint = torch.load(location, map_location="cuda")
-    state_dict = checkpoint["model"]
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+      state_dict = checkpoint["model"]
+    else:
+      state_dict = checkpoint
+    shvit.load_state_dict(state_dict)
+    if classes_output != 1000:
+      in_features_for_new_head = shvit.head.l.in_features
+      shvit.head.l = nn.Linear(in_features_for_new_head, classes_output, bias=True)
+
     return shvit
 
     
@@ -75,7 +99,7 @@ def build_base(classes_output=1000):
     model = torchvision.models.vit_b_16(weights=weights)
     in_features = model.heads.head.in_features
     if classes_output != 1000:
-        model.heads.head = nn.Linear(in_features, classes_output)
+      model.heads.head = nn.Linear(in_features, classes_output)
 
     return model
 
@@ -97,13 +121,26 @@ def data_loader(PATH, BATCH_SIZE, seed_worker, train_len=0.2):
     }
 
     print("Loading Stylized Images dataset...")
-    full_dataset = datasets.ImageFolder(PATH, transform=data_transforms['val'])
-    train_size = int(train_len * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    full_dataset = datasets.ImageFolder(PATH)
+    targets = full_dataset.targets
 
-    train_dataset.dataset.transform = data_transforms['train']
-    val_dataset.dataset.transform = data_transforms['val']
+    train_idx, val_idx = train_test_split(
+        np.arange(len(targets)),
+        train_size=train_len,
+        shuffle=True,
+        stratify=targets, 
+        random_state=42 
+    )
+
+    #train_size = int(train_len * len(full_dataset))
+    #val_size = len(full_dataset) - train_size
+    #train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+
+    #train_dataset.dataset.transform = data_transforms['train']
+    #val_dataset.dataset.transform = data_transforms['val']
+    train_dataset = ApplyTransform(Subset(full_dataset, train_idx), transform=data_transforms['train'])
+    val_dataset = ApplyTransform(Subset(full_dataset, val_idx), transform=data_transforms['val'])
+    
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, worker_init_fn=seed_worker, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, worker_init_fn=seed_worker, num_workers=2)
@@ -190,15 +227,15 @@ def train_model_timm(model, train_loader, val_loader, model_name, SAVE_DIR="~/te
     model.load_state_dict(best_model_wts)
     return model
 
-def train_model_base(model, train_loader, val_loader, model_name, SAVE_DIR,
-                freeze_strategy='head_only', num_epochs=10, DEVICE='cuda',
+def train_model_base(model, train_loader, val_loader, model_name, SAVE_DIR,num_epochs=10,
+                freeze_strategy='head_only', DEVICE='cuda',
                 learning_rate=1e-3):
 
     print(f"\n--- Starting fine-tuning for {model_name} with strategy: {freeze_strategy} ---")
     criterion = nn.CrossEntropyLoss()
     # Pre-compute a set of head parameters for efficient lookup
     # Adjust for torchvision ViT which has .heads.head
-    if model_name == "ViT-B/16": # Assuming this name is used for the torchvision model
+    if model_name == "ViT-B16": # Assuming this name is used for the torchvision model
         head_params_set = set(model.heads.head.parameters())
     else: # For SHViT or other models with .head
         head_params_set = set(model.head.parameters())
@@ -211,7 +248,7 @@ def train_model_base(model, train_loader, val_loader, model_name, SAVE_DIR,
 
         # Unfreeze the specific head parameters
         # Adjust for torchvision ViT which has .heads.head
-        if model_name == "ViT-B/16":
+        if model_name == "ViT-B16":
             for param in model.heads.head.parameters():
                 param.requires_grad = True
         elif hasattr(model, 'head'): # For SHViT

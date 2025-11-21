@@ -871,9 +871,9 @@ class ConceptDiscovery(object):
 
     # Add subsequent stages to the new model
     if stage_num < 2:
-        cutted_model_list['blocks2'] = self.model.blocks2
+      cutted_model_list['blocks2'] = self.model.blocks2
     if stage_num < 3:
-        cutted_model_list['blocks3'] = self.model.blocks3
+      cutted_model_list['blocks3'] = self.model.blocks3
     
     # Add the final classification layers
     cutted_model_list['pool'] = torch.nn.AdaptiveAvgPool2d(1)
@@ -881,25 +881,7 @@ class ConceptDiscovery(object):
     cutted_model_list['head'] = self.model.head
 
     return torch.nn.Sequential(cutted_model_list)
-
-  def _get_cutted_model(self, bottleneck, upper_bottleneck=None):
-    # get layers only after bottleneck
-    new_model_list_keys = []
-    new_model_list_vals = []
-    add_to_list = False
-
-    # construct layer generator
-    if 'vgg' in self.args.model_to_run or self.args.model_to_run == 'alexnet' or self.args.model_to_run == 'resnet18_cub':
-      layer_generator = self.model.features.named_children()
-    elif self.args.model_to_run == 'clip_r50':
-      if '.' in bottleneck:
-    # Add the final classification layers
-    cutted_model_list['pool'] = torch.nn.AdaptiveAvgPool2d(1)
-    cutted_model_list['flatten'] = torch.nn.Flatten(1)
-    cutted_model_list['head'] = self.model.head
-
-    return torch.nn.Sequential(cutted_model_list)
-
+  
   def _get_cutted_model(self, bottleneck, upper_bottleneck=None):
     # get layers only after bottleneck
     new_model_list_keys = []
@@ -971,6 +953,24 @@ class ConceptDiscovery(object):
         add_to_list = True
 
     # add final layers to model
+    if upper_bottleneck is None:
+      if 'vgg' in self.args.model_to_run or self.args.model_to_run == 'tf_mobilenetv3_large_075':
+        if self.args.model_to_run == 'tf_mobilenetv3_large_075':
+          new_model_list_keys.append('global_pool')
+          new_model_list_vals.append(self.model.global_pool)
+          new_model_list_keys.append('conv_head')
+          new_model_list_vals.append(self.model.conv_head)
+          new_model_list_keys.append('act2')
+          new_model_list_vals.append(self.model.act2)
+          new_model_list_keys.append('flatten')
+          new_model_list_vals.append(torch.nn.Flatten())
+          new_model_list_keys.append('classifier')
+          new_model_list_vals.append(self.model.classifier)
+        elif 'vgg' in self.args.model_to_run:
+          if 'sin' in self.args.model_to_run:
+            new_model_list_keys.append('flatten')
+            new_model_list_vals.append(torch.nn.Flatten())
+            new_model_list_keys.append('classifier')
             new_model_list_vals.append(self.model.classifier)
           else:
             new_model_list_keys.append('pre_logits')
@@ -1428,9 +1428,8 @@ def make_model(settings, hook=True):
   elif settings.model_to_run == 'huge_vit':
     model = timm.create_model('vit_huge_patch14_224', pretrained=settings.pretrained)
   elif settings.model_to_run == 'shvit':
-    num_classes= 1000
-    model_path = '/home/mauricio.alvarez/tesis/VCC/model_weights/SHViT/shvit_s1.pth'
-    model = build_shvit('s1', model_path, num_classes)
+    model_path = '/home/mauricio.alvarez/tesis/VCC/model_weights/shvit_s1.pth'
+    model = build_shvit('s1', settings.model_path, 16)
     print("SHViT loaded: ", model)
   elif settings.model_to_run == 'vit_large':
       model = timm.create_model('vit_large_patch16_224',pretrained=False)
@@ -1484,6 +1483,7 @@ def make_model(settings, hook=True):
   elif settings.model_to_run == 'custom':
     # Change this to accept other models
     model = timm.create_model('vit_large_patch16_224', pretrained=False, num_classes=1000)
+    #model = timm.create_model('vit_tiny_patch16_224', pretrained=False, num_classes=1000)
     in_features = model.head.in_features
     model.head = nn.Linear(in_features, 16)
     checkpoint = torch.load(settings.model_path, map_location='cuda')
@@ -1591,10 +1591,6 @@ def make_model(settings, hook=True):
   model.eval()
   if settings.target_dataset == 'toy1':
     model.label_to_id = {'00': 0,'10': 1,'20': 2,'01': 3,'11': 4,'21': 5,'02': 6,'12': 7,'22': 8}
-  elif settings.target_dataset == 'toy2' or settings.target_dataset == 'toy3':
-    model.label_to_id = {
-    model.class_idx = {k: v for (k, v) in enumerate(model.labels)}
-
   elif settings.target_dataset == 'custom':
     class_names = sorted([d.name for d in os.scandir(settings.imagenet_path) if d.is_dir()])
     model.labels = [name.replace('_', ' ') for name in class_names]
