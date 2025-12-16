@@ -64,13 +64,13 @@ def get_imagenet_labels():
 
 def build_shvit(shvit_name, location, classes_output=1000):
     if shvit_name == 's1':
-      shvit = shvit_s1(num_classes=16)
+      shvit = shvit_s1(num_classes=1000)
     elif shvit_name == 's2':
-      shvit = shvit_s2(num_classes=1000)
+      shvit = shvit_s2(num_classes=classes_output)
     elif shvit_name == 's3':
-      shvit = shvit_s3(num_classes=1000)
+      shvit = shvit_s3(num_classes=classes_output)
     elif shvit_name == 's4':
-      shvit = shvit_s4(num_classes=1000)
+      shvit = shvit_s4(num_classes=classes_output)
     else:
       print("ADD A VALID MODEL NAME: [s1,s2,s3,s4] ")
       return
@@ -219,7 +219,7 @@ def train_model_timm(model, train_loader, val_loader, model_name, SAVE_DIR="~/te
             if phase == 'val' and epoch_acc > best_acc:
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
-                torch.save(model.state_dict(), os.path.join(SAVE_DIR, f'{model_name}_{freeze_strategy}_best_finetuned.pth'))
+                torch.save(model.state_dict(), os.path.join(SAVE_DIR, f'imagenet_r_{model_name}_{best_acc:-4f}acc.pth'))
                 print(f"Saved best model for {model_name} ({freeze_strategy}) with accuracy: {best_acc:.4f}")
 
     print(f'Fine-tuning complete for {model_name} ({freeze_strategy})')

@@ -14,21 +14,23 @@ if __name__ == '__main__':
     shvit_s1 = '/home/mauricio.alvarez/tesis/VCC/model_weights/SHViT/shvit_s1.pth'
     shvit_s4 = '/home/mauricio.alvarez/tesis/VCC/model_weights/SHViT/shvit_s4.pth'
     SAVE_DIR = '/home/mauricio.alvarez/tesis/VCC/model_weights'
-    IMAGES_DIR = '/home/mauricio.alvarez/tesis/archive/session-1'
-    NUM_CLASS = 16
+    #IMAGES_DIR = '/home/mauricio.alvarez/tesis/archive/session-1'
+    IMAGES_DIR = '/home/mauricio.alvarez/tesis/archive/imagenet-r'
+    #NUM_CLASS = 16
+    NUM_CLASS = 200
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
         print(f"Created directory: {SAVE_DIR}")
     # Train a model: Vit Base and Large
     train_loader, val_loader = data_loader(IMAGES_DIR, batch_size, seed_worker, 0.3)
-    model = build_shvit('s4', shvit_s4, NUM_CLASS)
-    #model = build_timm(vit_large, NUM_CLASS)
+    #model = build_shvit('s1', shvit_s1, NUM_CLASS)
+    model = build_timm(vit_large, NUM_CLASS)
     #model = build_base(NUM_CLASS)
     #model = build_timm(vit_tiny, NUM_CLASS)
     model.to(device)
     print(model)
-    #model_finetuned = train_model_base(model, train_loader, val_loader, 'ViT-B16', SAVE_DIR=SAVE_DIR,num_epochs=50)
-    model_finetuned = train_model_timm(model, train_loader, val_loader, 'SHViT-S4', SAVE_DIR=SAVE_DIR,num_epochs=50)
+    #model_finetuned = train_model_base(model, train_loader, val_loader, 'ViT-B16', SAVE_DIR=SAVE_DIR,num_epochs=15)
+    model_finetuned = train_model_timm(model, train_loader, val_loader, 'ViT-Large', SAVE_DIR=SAVE_DIR,num_epochs=15)
 
 
 

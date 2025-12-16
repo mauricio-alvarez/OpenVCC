@@ -1338,6 +1338,7 @@ class ConceptDiscovery(object):
 cls_token_blobs = []
 features_blobs = []
 def hook_feature(module, input, output):
+  print(f"!!! DEBUG: Hook fired! Output shape: {output.shape} !!!")
   """This hook robustly handles both CNN and Vision Transformer outputs."""  
   # Check if the output is a 3D tensor, characteristic of a ViT block.
   if len(output.shape) == 3:
@@ -1482,12 +1483,23 @@ def make_model(settings, hook=True):
   
   elif settings.model_to_run == 'custom':
     # Change this to accept other models
-    model = timm.create_model('vit_large_patch16_224', pretrained=False, num_classes=1000)
-    #model = timm.create_model('vit_tiny_patch16_224', pretrained=False, num_classes=1000)
+    #weights = torchvision.models.ViT_B_16_Weights.DEFAULT
+    #model = torchvision.models.vit_b_16(weights=None)
+    #in_features = model.heads.head.in_features
+    #model.heads.head = nn.Linear(in_features, 16)
+
+    #model = timm.create_model('vit_large_patch16_224', pretrained=False, num_classes=1000)
+    model = timm.create_model('vit_tiny_patch16_224', pretrained=False, num_classes=1000)
     in_features = model.head.in_features
     model.head = nn.Linear(in_features, 16)
     checkpoint = torch.load(settings.model_path, map_location='cuda')
-    model.load_state_dict(checkpoint)
+    if 'model' in checkpoint:
+      state_dict = checkpoint['model']
+    elif 'state_dict' in checkpoint:
+      state_dict = checkpoint['state_dict']
+    else:
+      state_dict = checkpoint
+    model.load_state_dict(state_dict)
 
   else:
     checkpoint = torch.load(settings.model_path)
@@ -1511,82 +1523,76 @@ def make_model(settings, hook=True):
 
   if hook:
     target_layer_val = getattr(settings, 'target_layer', None)
-    target_submodule_val = getattr(settings, 'target_submodule', None)
-
+    
     if target_layer_val is not None:
       target_layer_index = int(target_layer_val)
-      if 'shvit' in settings.model_to_run:
-        try:
-          target_block_name = f'blocks{target_layer_index}'
-          target_module = getattr(model, target_block_name)
-          target_module.register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked SHViT stage '{target_block_name}' ---")
-        except (AttributeError, IndexError) as e:
-          print(f"Fatal Error: Could not find SHViT stage '{target_block_name}'---")
-          raise e
+      target_module = None
+      container_type = "unknown"
 
-      elif target_submodule_val:
-        # We are targeting a submodule (e.g., 'attn')
-        try:
-          layer = model.blocks[target_layer_index]
-          submodule = getattr(layer, target_submodule_val)
-          submodule.register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked submodule '{target_submodule_val}' of layer '{target_layer_index}' ---")
-        except (AttributeError, IndexError) as e:
-          print(f"ERROR: Could not find layer '{target_layer_index}' or submodule '{target_submodule_val}'.")
-          raise e
-      else:
-        # Original logic: target the whole block
-        try:
-          model.blocks[target_layer_index].register_forward_hook(hook_feature)
-          print(f"--- Successfully hooked entire block of layer '{target_layer_index}' ---")
-        except (AttributeError, IndexError) as e:
-          print(f"ERROR: Could not find layer '{target_layer_index}'.")
-          raise e
-    else:        
-      for name in settings.feature_names:
-        if settings.model_to_run == 'alexnet':
-          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-        elif settings.model_to_run == 'mobilenet_v2' or settings.model_to_run == 'efficientnet_b4' or settings.model_to_run == 'mnasnet_a1' or settings.model_to_run == 'tf_mobilenetv3_large_075':
-          # model._modules['features']._modules.get(name).register_forward_hook(hook_feature) # toch hub
-          if '.' in name:
-            module_name = name.split('.')[0]
-            layer_name = name.split('.')[1]
-            model._modules['blocks']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-          else:
-            model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature) # timm
-        elif 'vgg' in settings.model_to_run:
-          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-        elif settings.model_to_run == 'clip_r50':
-          if '.' in name:
-            module_name = name.split('.')[0]
-            layer_name = name.split('.')[1]
-            # model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-            model._modules['visual']._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-          else:
-            model._modules['visual']._modules.get(name).register_forward_hook(hook_feature)
-        elif settings.model_to_run == 'clip_vit':
-          model._modules['visual']._modules['transformer']._modules['resblocks']._modules.get(name).register_forward_hook(hook_feature)
-        elif settings.model_to_run == 'mvit':
-          model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature_mvit)
-        elif settings.model_to_run.find('vit') > -1:
-          model._modules['blocks']._modules.get(name).register_forward_hook(hook_feature)
-        elif settings.model_to_run.find('cub') > -1:
-          model._modules['features']._modules.get(name).register_forward_hook(hook_feature)
-  
-        # for name, module in self.model.named_modules():
+      # 1. Check for SHViT (Hierarchical Stages)
+      if 'shvit' in settings.model_to_run:
+        # Map layer index to stage name (e.g., 1 -> blocks1)
+        stage_name = f'blocks{target_layer_index}'
+        if hasattr(model, stage_name):
+          target_module = getattr(model, stage_name)
+          container_type = "shvit_stage"
         else:
-          if '.' in name:
-            if len(name.split('.')) == 2:
-              module_name = name.split('.')[0]
-              layer_name = name.split('.')[1]
-              model._modules.get(module_name)._modules.get(layer_name).register_forward_hook(hook_feature)
-            elif len(name.split('.')) == 3:
-              model._modules.get(name.split('.')[0])._modules.get(name.split('.')[1])._modules.get(name.split('.')[2]).register_forward_hook(hook_feature)
-          else:
-            model._modules.get(name).register_forward_hook(hook_feature)
-      model.cuda()
-  
+          raise AttributeError(f"SHViT model does not have stage '{stage_name}'")
+
+      # 2. Check for Timm ViT (Flat Blocks)
+      elif hasattr(model, 'blocks'):
+        try:
+          target_module = model.blocks[target_layer_index]
+          container_type = "timm_block"
+        except IndexError:
+          raise IndexError(f"Timm ViT: Layer {target_layer_index} out of range (0-{len(model.blocks)-1})")
+
+      # 3. Check for Torchvision ViT (Encoder Layers)
+      elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layers'):
+        try:
+          target_module = model.encoder.layers[target_layer_index]
+          container_type = "torchvision_layer"
+        except IndexError:
+          raise IndexError(f"Torchvision ViT: Layer {target_layer_index} out of range.")
+
+      # 4. Fallback (Features)
+      elif hasattr(model, 'features'):
+        target_module = model.features[target_layer_index]
+        container_type = "features"
+
+      if target_module is None:
+        raise AttributeError(f"Could not find layer container for model {type(model)}.")
+
+      print(f"--- Hooking Target: {container_type} at index {target_layer_index} ---")
+
+      # --- Handle Submodules (attn vs self_attention) ---
+      target_submodule_val = getattr(settings, 'target_submodule', None)
+      if target_submodule_val:
+        # Alias handling: Torchvision uses 'self_attention', Timm uses 'attn'
+        if target_submodule_val == 'attn' and not hasattr(target_module, 'attn') and hasattr(target_module, 'self_attention'):
+          print("--- INFO: Aliasing 'attn' to 'self_attention' for Torchvision model ---")
+          target_submodule_val = 'self_attention'
+            
+        try:
+          target_module = getattr(target_module, target_submodule_val)
+          print(f"--- Refined Hook to Submodule: {target_submodule_val} ---")
+        except AttributeError:
+          raise AttributeError(f"Layer does not have submodule '{target_submodule_val}'. Available: {dir(target_module)}")
+
+      # Apply the hook
+      target_module.register_forward_hook(hook_feature)
+      print("--- Hook successfully registered ---")
+
+  else:
+    # Fallback for original list-based feature_names (mostly for CNNs)
+    for name in settings.feature_names:
+      try:
+        if hasattr(model, 'blocks'): model.blocks._modules.get(name).register_forward_hook(hook_feature)
+        elif hasattr(model, 'features'): model.features._modules.get(name).register_forward_hook(hook_feature)
+        else: model._modules.get(name).register_forward_hook(hook_feature)
+      except:
+        print(f"Warning: Failed to hook {name}")
+
   model.cuda()
   model.eval()
   if settings.target_dataset == 'toy1':
