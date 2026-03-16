@@ -1,0 +1,6 @@
+[submodule "imagenetood}"]
+	path = imagenetood}
+	url = https://github.com/princetonvisualai/imagenetood.git
+[submodule "imagenetood"]
+	path = imagenetood
+	url = https://github.com/princetonvisualai/imagenetood.git
