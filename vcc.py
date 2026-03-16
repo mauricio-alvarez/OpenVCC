@@ -18,7 +18,7 @@ from tqdm import tqdm
 from threadpoolctl import threadpool_limits
 import matplotlib.pyplot as plt
 import torch.nn as nn
-from train_model import set_seed, build_shvit
+from train_model import set_seed, build_shvit, load_finetuned_monster
 
 class ConceptDiscovery(object):
   def __init__(self,
@@ -1500,7 +1500,8 @@ def make_model(settings, hook=True):
     else:
       state_dict = checkpoint
     model.load_state_dict(state_dict)
-
+  elif settings.model_to_run == 'double':
+    model = load_finetuned_monster(settings.model_path, settings.num_classes)
   else:
     checkpoint = torch.load(settings.model_path)
     if type(checkpoint).__name__ == 'OrderedDict' or type(checkpoint).__name__ == 'dict':
@@ -1538,7 +1539,13 @@ def make_model(settings, hook=True):
           container_type = "shvit_stage"
         else:
           raise AttributeError(f"SHViT model does not have stage '{stage_name}'")
-
+      # fusion_conv
+      elif 'double' in settings.model_to_run:
+        if hasattr(model, 'fusion_conv'):
+          target_module = model.fusion_conv
+          container_type = "fusion_conv"
+        else:
+          raise AttributeError("DoubleHeadSHViT model does not have fusion_conv")
       # 2. Check for Timm ViT (Flat Blocks)
       elif hasattr(model, 'blocks'):
         try:
