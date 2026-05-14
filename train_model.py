@@ -6,6 +6,9 @@ import torchvision.transforms as trn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 from torchvision import datasets, transforms
 import timm
 from timm.scheduler import create_scheduler
@@ -16,8 +19,10 @@ import os
 import copy
 import random
 import numpy as np
-from SHViT import BN_Linear, shvit_s1, shvit_s2, shvit_s3, shvit_s4, DoubleHeadSHViT
+from SHViT import BN_Linear, shvit_s1, shvit_s2, shvit_s3, shvit_s4, DoubleHeadSHViT, TripleHeadSHViT, SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
 import torchvision
+from functools import partial
+from algorithms import logit_only, training_based
 
 class L0Mask(nn.Module):
     def __init__(self, num_heads, temp=2./3., limit_l=-0.1, limit_r=1.1):
@@ -137,9 +142,10 @@ def freeze_stage_1(model):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model Frozen. Trainable Params: {trainable_params/1e6:.2f}M / {total_params/1e6:.2f}M")
 
-def build_and_load_monster(original_shvit, num_classes=1000):
+def build_and_load_monster(original_shvit, num_classes=1000, model_cfg=None):
+    if model_cfg is None: model_cfg = {}
     print("Building DoubleHeadSHViT...")
-    monster = DoubleHeadSHViT(num_classes=num_classes)
+    monster = DoubleHeadSHViT(num_classes=num_classes, **model_cfg)
     
     print(" - Copying Shared Stem and Stage 1...")
     monster.patch_embed.load_state_dict(original_shvit.patch_embed.state_dict())
@@ -164,6 +170,7 @@ def build_and_load_monster(original_shvit, num_classes=1000):
     
     copy_params(src_ds_2, monster.ds_1_to_2_B)
     copy_params(src_blks_2, monster.blocks2_B)
+    for param in monster.blocks2_B.parameters(): param.data += torch.randn_like(param) * 1e-4
 
     # --- Stage 3 ---
     src_ds_3 = [original_shvit.blocks3[i] for i in range(3)]
@@ -174,14 +181,25 @@ def build_and_load_monster(original_shvit, num_classes=1000):
     
     copy_params(src_ds_3, monster.ds_2_to_3_B)
     copy_params(src_blks_3, monster.blocks3_B)
+    for param in monster.blocks3_B.parameters(): param.data += torch.randn_like(param) * 1e-4
     
     print("Monster initialized successfully!")
     return monster
 
-def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda'):
+def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda', model_cfg=None):
     print(f"Loading finetuned monster from {checkpoint_path}...")
+    if model_cfg is None:
+        if 's4' in checkpoint_path:
+            model_cfg = SHViT_s4
+        elif 's3' in checkpoint_path:
+            model_cfg = SHViT_s3
+        elif 's2' in checkpoint_path:
+            model_cfg = SHViT_s2
+        else:
+            model_cfg = SHViT_s1
+            
     # Always initialize with 1000 classes to match standard checkpoints
-    monster = DoubleHeadSHViT(num_classes=num_classes)
+    monster = DoubleHeadSHViT(num_classes=num_classes, **model_cfg)
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model" in checkpoint:
@@ -189,7 +207,7 @@ def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda'):
     else:
         state_dict = checkpoint
         
-    monster.load_state_dict(state_dict)
+    monster.load_state_dict(state_dict, strict=False)
     
     # If the user requested a different number of classes, replace the head
     if num_classes != 1000:
@@ -200,6 +218,91 @@ def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda'):
     monster.to(device)
     monster.eval()
     print("Monster loaded and ready!")
+    return monster
+
+def build_and_load_triple_monster(original_shvit, num_classes=1000, model_cfg=None):
+    if model_cfg is None: model_cfg = {}
+    print("Building TripleHeadSHViT...")
+    monster = TripleHeadSHViT(num_classes=num_classes, **model_cfg)
+    
+    print(" - Copying Shared Stem and Stage 1...")
+    monster.patch_embed.load_state_dict(original_shvit.patch_embed.state_dict())
+    monster.blocks1.load_state_dict(original_shvit.blocks1.state_dict())
+    monster.head.load_state_dict(original_shvit.head.state_dict())
+    
+    print(" - Duplicating Stage 2 and 3 to all three heads...")
+
+    def copy_params(src_layers, dest_module):
+        # We wrap source layers in a temporary Sequential.
+        # This re-indexes keys to '0', '1', '2' matching the destination Sequential.
+        temp_seq = torch.nn.Sequential(*src_layers)
+        dest_module.load_state_dict(temp_seq.state_dict())
+
+    # --- Stage 2 ---
+    src_ds_2 = [original_shvit.blocks2[i] for i in range(3)] 
+    src_blks_2 = [original_shvit.blocks2[i] for i in range(3, len(original_shvit.blocks2))]
+
+    copy_params(src_ds_2, monster.ds_1_to_2_A)
+    copy_params(src_blks_2, monster.blocks2_A)
+    
+    copy_params(src_ds_2, monster.ds_1_to_2_B)
+    copy_params(src_blks_2, monster.blocks2_B)
+    for param in monster.blocks2_B.parameters(): param.data += torch.randn_like(param) * 1e-4
+
+    copy_params(src_ds_2, monster.ds_1_to_2_C)
+    copy_params(src_blks_2, monster.blocks2_C)
+    for param in monster.blocks2_C.parameters(): param.data += torch.randn_like(param) * 1e-4
+
+    # --- Stage 3 ---
+    src_ds_3 = [original_shvit.blocks3[i] for i in range(3)]
+    src_blks_3 = [original_shvit.blocks3[i] for i in range(3, len(original_shvit.blocks3))]
+
+    copy_params(src_ds_3, monster.ds_2_to_3_A)
+    copy_params(src_blks_3, monster.blocks3_A)
+    
+    copy_params(src_ds_3, monster.ds_2_to_3_B)
+    copy_params(src_blks_3, monster.blocks3_B)
+    for param in monster.blocks3_B.parameters(): param.data += torch.randn_like(param) * 1e-4
+
+    copy_params(src_ds_3, monster.ds_2_to_3_C)
+    copy_params(src_blks_3, monster.blocks3_C)
+    for param in monster.blocks3_C.parameters(): param.data += torch.randn_like(param) * 1e-4
+    
+    print("Triple Monster initialized successfully!")
+    return monster
+
+def load_finetuned_triple_monster(checkpoint_path, num_classes=1000, device='cuda', model_cfg=None):
+    print(f"Loading finetuned triple monster from {checkpoint_path}...")
+    if model_cfg is None:
+        if 's4' in checkpoint_path:
+            model_cfg = SHViT_s4
+        elif 's3' in checkpoint_path:
+            model_cfg = SHViT_s3
+        elif 's2' in checkpoint_path:
+            model_cfg = SHViT_s2
+        else:
+            model_cfg = SHViT_s1
+            
+    # Always initialize with 1000 classes to match standard checkpoints
+    monster = TripleHeadSHViT(num_classes=num_classes, **model_cfg)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+        
+    monster.load_state_dict(state_dict, strict=False)
+    
+    # If the user requested a different number of classes, replace the head
+    if num_classes != 1000:
+        print(f"Modifying head: 1000 -> {num_classes} classes")
+        in_features = monster.head.l.in_features
+        monster.head = BN_Linear(in_features, num_classes)
+        
+    monster.to(device)
+    monster.eval()
+    print("Triple Monster loaded and ready!")
     return monster
 
 def build_shvit(shvit_name, location, classes_output=1000):
@@ -310,11 +413,11 @@ def data_loader(PATH, BATCH_SIZE, seed_worker, train_len=0.2):
 
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, worker_init_fn=seed_worker,
-        shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=False
     )
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, worker_init_fn=seed_worker,
-        num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True
+        num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=False
     )
 
     print(f"Train dataset size: {len(train_dataset)}")
@@ -504,18 +607,40 @@ def train_model_base(model, train_loader, val_loader, model_name, SAVE_DIR,num_e
     model.load_state_dict(best_model_wts)
     return model
 
-def train_monster(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS):
+def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    shvit_name = 's1'
+    model_cfg = SHViT_s1
+    if 's4' in model_location:
+        shvit_name = 's4'
+        model_cfg = SHViT_s4
+    elif 's3' in model_location:
+        shvit_name = 's3'
+        model_cfg = SHViT_s3
+    elif 's2' in model_location:
+        shvit_name = 's2'
+        model_cfg = SHViT_s2
 
     # 1. Load Standard Pretrained SHViT
     if use_shvit:
-      print("Loading original SHViT...")
-      original_model = build_shvit('s1', model_location, classes_output=1000)
-      print("Constructing Double-Head Monster...")
-      model = build_and_load_monster(original_model, num_classes=NUM_CLASS)
+      print(f"Loading original SHViT {shvit_name}...")
+      original_model = build_shvit(shvit_name, model_location, classes_output=1000)
+      if num_heads == 2:
+        print("Constructing Double-Head Monster...")
+        model = build_and_load_monster(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg)
+      elif num_heads == 3:
+        print("Constructing Triple-Head Monster...")
+        model = build_and_load_triple_monster(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg)
+      else:
+        raise ValueError(f"Invalid number of heads: {num_heads}. Must be 2 or 3.")
     else:
-      original_model = load_finetuned_monster(model_location, num_classes=NUM_CLASS, device=device)
-      model = original_model  
+      if num_heads == 2:
+        model = load_finetuned_monster(model_location, num_classes=NUM_CLASS, device=device, model_cfg=model_cfg)
+      elif num_heads == 3:
+        model = load_finetuned_triple_monster(model_location, num_classes=NUM_CLASS, device=device, model_cfg=model_cfg)
+      else:
+        raise ValueError(f"Invalid number of heads: {num_heads}. Must be 2 or 3.")
     
     freeze_stage_1(model)
     model.to(device)
@@ -541,8 +666,16 @@ def train_monster(use_shvit, model_location, loader_train, loader_eval, NUM_CLAS
 
             # AMP Context
             with torch.cuda.amp.autocast():
-                output = model(input)
-                loss = criterion(output, target)
+                output_tuple = model(input)
+                if isinstance(output_tuple, tuple):
+                    output, routing_weights = output_tuple
+                    loss_ce = criterion(output, target)
+                    mean_routing = routing_weights.mean(dim=0)
+                    loss_bal = torch.var(mean_routing) * mean_routing.size(0)
+                    loss = loss_ce + 0.1 * loss_bal
+                else:
+                    output = output_tuple
+                    loss = criterion(output, target)
 
             scaler(loss, optimizer)
 
@@ -557,10 +690,172 @@ def train_monster(use_shvit, model_location, loader_train, loader_eval, NUM_CLAS
         print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
 
         # Save Checkpoint
-        if acc > best_acc:
+        if acc > best_acc or epoch%20==0:
             best_acc = acc
-            torch.save(model.state_dict(), "shvit_s1_doublehead_0103_300epochs_pretrained.pth")
+            torch.save(model.state_dict(), str(epoch)+"_"+output_file_name)
             print(f"Saved model with acc {acc:.2f}%")
+            
+    return model
+
+def train_monster_improved(use_shvit, num_heads, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name, resume_checkpoint=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    shvit_name = 's1'
+    model_cfg = SHViT_s1
+    if 's4' in model_location:
+        shvit_name = 's4'
+        model_cfg = SHViT_s4
+    elif 's3' in model_location:
+        shvit_name = 's3'
+        model_cfg = SHViT_s3
+    elif 's2' in model_location:
+        shvit_name = 's2'
+        model_cfg = SHViT_s2
+
+    # 1. Load Standard Pretrained SHViT
+    if use_shvit:
+      print(f"Loading original SHViT {shvit_name}...")
+      original_model = build_shvit(shvit_name, model_location, classes_output=1000)
+      if num_heads == 2:
+        print("Constructing Double-Head Monster...")
+        model = build_and_load_monster(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg)
+        # We no longer initialize fusion_conv as the model now uses an MoE Router.
+      elif num_heads == 3:
+        print("Constructing Triple-Head Monster...")
+        model = build_and_load_triple_monster(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg)
+        
+        # We no longer initialize fusion_conv as the model now uses an MoE Router.
+      else:
+        raise ValueError(f"Invalid number of heads: {num_heads}. Must be 2 or 3.")
+    else:
+      if num_heads == 2:
+        model = load_finetuned_monster(model_location, num_classes=NUM_CLASS, device=device, model_cfg=model_cfg)
+      elif num_heads == 3:
+        model = load_finetuned_triple_monster(model_location, num_classes=NUM_CLASS, device=device, model_cfg=model_cfg)
+      else:
+        raise ValueError(f"Invalid number of heads: {num_heads}. Must be 2 or 3.")
+    
+    freeze_stage_1(model)
+    model.to(device)
+
+    # FIX: Progressive Unfreezing
+    print("Progressive Unfreezing: Freezing Stage 2 and Stage 3 for the first 3 epochs...")
+    for name, param in model.named_parameters():
+        if 'blocks2' in name or 'blocks3' in name or 'ds_1_to_2' in name or 'ds_2_to_3' in name:
+            param.requires_grad = False
+
+    # FIX: Lower weight_decay to 0.01
+    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.AdamW(param_groups, lr=1e-4, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    criterion = torch.nn.CrossEntropyLoss()
+    scaler = NativeScaler() 
+
+    start_epoch = 0
+    best_acc = 0.0
+
+    if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            # Check if we are resuming after epoch 3 to set requires_grad properly
+            if 'epoch' in checkpoint and checkpoint['epoch'] >= 3:
+                for name, param in model.named_parameters():
+                    if 'blocks2' in name or 'blocks3' in name or 'ds_1_to_2' in name or 'ds_2_to_3' in name:
+                        param.requires_grad = True
+                
+                # Recreate the optimizer structure so load_state_dict matches the saved state
+                param_groups = [
+                    {'params': [p for n, p in model.named_parameters() if ('blocks2' in n or 'blocks3' in n or 'ds_1_to_2' in n or 'ds_2_to_3' in n) and p.requires_grad], 'lr': 1e-5},
+                    {'params': [p for n, p in model.named_parameters() if not ('blocks2' in n or 'blocks3' in n or 'ds_1_to_2' in n or 'ds_2_to_3' in n) and p.requires_grad], 'lr': 1e-4}
+                ]
+                optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - 3)
+
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_acc' in checkpoint:
+                best_acc = checkpoint['best_acc']
+        else:
+            model.load_state_dict(checkpoint)
+            print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
+
+    print("Starting Fine-tuning...")
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        if epoch == 3:
+            print("Unfreezing Stage 2 and Stage 3...")
+            for name, param in model.named_parameters():
+                if 'blocks2' in name or 'blocks3' in name or 'ds_1_to_2' in name or 'ds_2_to_3' in name:
+                    param.requires_grad = True
+            # Update optimizer groups and set a lower LR (1e-5) for the newly unfrozen layers
+            param_groups = [
+                {'params': [p for n, p in model.named_parameters() if ('blocks2' in n or 'blocks3' in n or 'ds_1_to_2' in n or 'ds_2_to_3' in n) and p.requires_grad], 'lr': 1e-5},
+                {'params': [p for n, p in model.named_parameters() if not ('blocks2' in n or 'blocks3' in n or 'ds_1_to_2' in n or 'ds_2_to_3' in n) and p.requires_grad], 'lr': 1e-4}
+            ]
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+            # Recreate scheduler to match remaining epochs
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - 3)
+
+        model.train()
+        total_loss = 0
+        num_steps = 0
+
+        for batch_idx, (input, target) in enumerate(loader_train):
+            input, target = input.to(device), target.to(device)
+
+            optimizer.zero_grad()
+
+            # AMP Context
+            with torch.cuda.amp.autocast():
+                output_tuple = model(input)
+                if isinstance(output_tuple, tuple):
+                    output, routing_weights = output_tuple
+                    loss_ce = criterion(output, target)
+                    # Load balancing loss: variance of the mean routing probabilities
+                    mean_routing = routing_weights.mean(dim=0)
+                    # multiply by number of branches (mean_routing.size(0)) to scale variance properly
+                    loss_bal = torch.var(mean_routing) * mean_routing.size(0)
+                    loss = loss_ce + 0.1 * loss_bal
+                else:
+                    output = output_tuple
+                    loss = criterion(output, target)
+
+            scaler(loss, optimizer)
+
+            total_loss += loss.item()
+            num_steps += 1
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch}: Step {batch_idx} Loss {loss.item():.4f}")
+        
+        scheduler.step()
+        
+        # Validation
+        acc = validate(model, loader_eval, device)
+        print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
+
+        # Save Checkpoint
+        if acc > best_acc or epoch % 20 == 0:
+            best_acc = acc
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'best_acc': best_acc
+            }
+            torch.save(checkpoint_dict, str(epoch)+"_"+output_file_name)
+            print(f"Saved model with acc {acc:.2f}%")
+            
+    return model
 
 VAL_PATH = "/home/mauricio.alvarez/tesis/archive/imagenet-val/imagenet-val"
 TEST_PATH = "/home/mauricio.alvarez/tesis/archive/imagenet-test"
@@ -692,7 +987,7 @@ def validate(model, loader, device):
     correct = 0
     total = 0
     with torch.no_grad():
-        for input, target in loader:
+        for input, target in tqdm(loader, desc="Validation"):
             input, target = input.to(device), target.to(device)
             output = model(input)
             _, predicted = torch.max(output.data, 1)
@@ -802,45 +1097,156 @@ def test_imagenet_r(model):
     iid_loader = torch.utils.data.DataLoader(iid_examples, batch_size=256, shuffle=False,
                                             num_workers=4, pin_memory=True)
 
-
+    if hasattr(model, 'module'):
+        net = model.module
+    else:
+        net = model
+        
     net = model
     net.cuda()
     net.eval()
 
+    temp_features = {}
+    def generic_hook(module, input, output, name):
+        temp_features[name] = input[0]
+
+    def get_last_layer(model):
+        if hasattr(model, 'module'):
+            base_model = model.module
+        else:
+            base_model = model
+            
+        if hasattr(base_model, 'head'):
+            return base_model.head
+        elif hasattr(base_model, 'fc'):
+            return base_model.fc
+        elif hasattr(base_model, 'classifier'):
+            return base_model.classifier
+        else:
+            return list(base_model.children())[-1]
+
+    last_layer = get_last_layer(net)
+    hook_handle = last_layer.register_forward_hook(partial(generic_hook, name="feat"))
+    
     concat = lambda x: np.concatenate(x, axis=0)
     to_np = lambda x: x.data.to('cpu').numpy()
 
     def get_predictions(loader):
-        confidence = []
-        correct = []
-        num_correct = 0
+        eval_features =[]
+        eval_logits = []
+        correct_list =[]
+        
         with torch.no_grad():
             for data, target in loader:
                 data, target = data.cuda(), target.cuda()
-                output = net(data)[:,imagenet_r_mask]
+                
+                # Forward pass
+                output = net(data)
 
-                # accuracy
-                pred = output.data.max(1)[1]
-                num_correct += pred.eq(target.data).sum().item()
+                if "feat" not in temp_features:
+                    raise RuntimeError(f"Hook failed to trigger! Attached to: {last_layer}")
+                
+                eval_logits.append(output.detach().cpu())
+                eval_features.append(temp_features["feat"].detach().cpu())
+                correct_list.extend(target.cpu().numpy())
+                
+                # Clear the dictionary to be safe for the next batch
+                del temp_features["feat"]
 
-                confidence.extend(to_np(F.softmax(output, dim=1).max(1)[0]).squeeze().tolist())
-                pred = output.data.max(1)[1]
-                correct.extend(pred.eq(target).to('cpu').numpy().squeeze().tolist())
+        eval_logits = torch.cat(eval_logits)
+        eval_features = torch.cat(eval_features)
+        targets = np.array(correct_list)
 
-        return np.array(confidence), np.array(correct), num_correct
+        # Restrict logits to the 200 ImageNet-R classes
+        logits_200 = eval_logits[:, imagenet_r_mask]
+
+        # Calculate Accuracy (1.0 for correct, 0.0 for incorrect)
+        preds = logits_200.max(1)[1].numpy()
+        correct = (preds == targets).astype(float)
+        num_correct = correct.sum()
+
+        # Calculate all Confidence Scores
+        scores = {}
+        
+        probs_200 = F.softmax(logits_200, dim=1)
+        
+        # 1. MSP (on 200 classes)
+        scores['msp'] = probs_200.max(1)[0].numpy()
+        
+        # Predictive Entropy (negative entropy so higher = more confident)
+        scores['neg_entropy'] = torch.sum(probs_200 * torch.log(probs_200 + 1e-12), dim=1).numpy()
+        
+        # 2. Max Logits (on 200 classes)
+        scores['ml'] = logits_200.max(1)[0].numpy()
+        
+        # 3. Energy (on 200 classes)
+        scores['energy'] = torch.logsumexp(logits_200, dim=1).numpy()
+        
+        # 4. Maximum Cosine (Requires full features/weights)
+        try:
+            scores['Maximum Cosine'] = logit_only["Maximum Cosine"](eval_features, last_layer).numpy()
+        except Exception as e:
+            pass
+            
+        # 5. ASH
+        try:
+            if "ash" in training_based:
+                scores['ash_b'] = training_based["ash"](eval_features, last_layer, 90, version='b').numpy()
+        except Exception as e:
+            pass
+
+        return scores, correct, num_correct, preds, targets
 
 
-    def get_acc(loader):
-        confidence, correct, num_correct = get_predictions(loader)
-        acc = num_correct / len(loader.dataset)
-        print('Accuracy (%):\t\t', round(100*acc, 2))
-        show_calibration_results(confidence, correct)
+    def get_acc(loader, dataset_name):
+        scores, correct, num_correct, preds, targets = get_predictions(loader)
+        acc = num_correct / len(correct)
+        
+        print(f'{dataset_name} Results')
+        print(f'Accuracy (%):\t\t {round(100 * acc, 2)}')
+        
+        if 'msp' in scores:
+            correct_mask = (correct == 1.0)
+            msp_correct = scores['msp'][correct_mask].mean() if correct_mask.sum() > 0 else 0
+            msp_incorrect = scores['msp'][~correct_mask].mean() if (~correct_mask).sum() > 0 else 0
+            print(f'Mean MSP (Correct):\t {msp_correct:.4f}')
+            print(f'Mean MSP (Incorrect):\t {msp_incorrect:.4f}')
+            
+        # Save Confusion Matrix
+        cm = confusion_matrix(targets, preds)
+        cm_filename = f'confusion_matrix_{dataset_name.replace(" ", "_")}.npy'
+        np.save(cm_filename, cm)
+        print(f'Saved Confusion Matrix array to: {cm_filename}')
+        
+        # Save as PNG
+        plt.figure(figsize=(20, 16))
+        sns.heatmap(cm, cmap='Blues')
+        plt.title(f'Confusion Matrix: {dataset_name}')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        png_filename = f'confusion_matrix_{dataset_name.replace(" ", "_")}.png'
+        plt.savefig(png_filename, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f'Saved Confusion Matrix image to: {png_filename}')
+        
+        print('\nAURRA (%):')
+        for metric_name, confidence in scores.items():
+            aurra_val = aurra(confidence, correct) * 100
+            print(f'  {metric_name:<15}: {aurra_val:.2f}')
+            
+        # Only MSP is bounded [0, 1] for a valid RMSCE calculation
+        if 'msp' in scores:
+            rmsce = calib_err(scores['msp'], correct, p='2') * 100
+            ece = calib_err(scores['msp'], correct, p='1') * 100
+            print(f'\nRMS Calib Error (RMSCE) [%]: {rmsce:.2f}')
+            print(f'Expected Calib Error (ECE) [%]: {ece:.2f}')
+            
         return acc
 
-
-    print('ImageNet-200 Results')
-    acc_orig = get_acc(iid_loader)
-    print("\nImageNet-R Results")
-    acc_r = get_acc(imagenet_r_loader)
+    print('='*40)
+    acc_orig = get_acc(iid_loader, 'ImageNet-200')
+    acc_r = get_acc(imagenet_r_loader,'ImageNet-R')
     print('\nDelta Acc (%):\t\t', round(100*(acc_orig - acc_r), 2))
+    hook_handle.remove()
+
     
