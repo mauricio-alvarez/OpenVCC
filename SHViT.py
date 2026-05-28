@@ -405,8 +405,118 @@ class DoubleHeadSHViT(nn.Module):
         self.ds_2_to_3_B = self._make_downsample(embed_dim, 1)
         self.blocks3_B = self._make_stage(embed_dim[2], qk_dim[2], partial_dim[2], depth[2], types[2])
 
-        # --- FUSION ---
-        self.fusion_conv = Conv2d_BN(embed_dim[2] * 2, embed_dim[2], 1, 1, 0)
+        # --- FUSION / DIVERSIFIED ENSEMBLE ---
+        # Each branch gets its own classification head (no router)
+        self.head_A = BN_Linear(embed_dim[-1], num_classes) if num_classes > 0 else nn.Identity()
+        self.head_B = BN_Linear(embed_dim[-1], num_classes) if num_classes > 0 else nn.Identity()
+
+    def _make_downsample(self, embed_dim, idx):
+        layers = []
+        # 1. Pre-proc (Matches original blocks[0])
+        layers.append(nn.Sequential(
+            Residual(Conv2d_BN(embed_dim[idx], embed_dim[idx], 3, 1, 1, groups=embed_dim[idx])),
+            Residual(FFN(embed_dim[idx], int(embed_dim[idx] * 2))),
+        ))
+        # 2. Patch Merging (Matches original blocks[1])
+        layers.append(PatchMerging(embed_dim[idx], embed_dim[idx+1]))
+        
+        # 3. Post-proc (Matches original blocks[2])
+        layers.append(nn.Sequential(
+            Residual(Conv2d_BN(embed_dim[idx+1], embed_dim[idx+1], 3, 1, 1, groups=embed_dim[idx+1])),
+            Residual(FFN(embed_dim[idx+1], int(embed_dim[idx+1] * 2))),
+        ))
+        return nn.Sequential(*layers)
+
+    def _make_stage(self, ed, kd, pd, dpth, typ):
+        layers = []
+        for d in range(dpth):
+            layers.append(BasicBlock(ed, kd, pd, typ))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = self.blocks1(x)
+
+        # Branch A
+        xA = self.ds_1_to_2_A(x)
+        xA = self.blocks2_A(xA)
+        xA = self.ds_2_to_3_A(xA)
+        xA = self.blocks3_A(xA)
+
+        # Branch B
+        xB = self.ds_1_to_2_B(x)
+        xB = self.blocks2_B(xB)
+        xB = self.ds_2_to_3_B(xB)
+        xB = self.blocks3_B(xB)
+
+        # Pool features from each branch independently
+        feat_A = torch.nn.functional.adaptive_avg_pool2d(xA, 1).flatten(1)
+        feat_B = torch.nn.functional.adaptive_avg_pool2d(xB, 1).flatten(1)
+
+        logits_A = self.head_A(feat_A)
+        logits_B = self.head_B(feat_B)
+
+        if self.training:
+            # Return per-branch logits and features for diversity loss
+            return logits_A, logits_B, feat_A, feat_B
+        # Ensemble average at inference
+        return (logits_A + logits_B) / 2
+
+class TripleHeadSHViT(nn.Module):
+    def __init__(self,
+                 in_chans=3,
+                 num_classes=1000,
+                 embed_dim=[128, 224, 320],
+                 qk_dim=[16, 16, 16],
+                 partial_dim=[32, 48, 68],
+                 depth=[2, 4, 5],
+                 types=["i", "s", "s"],
+                 down_ops=[['subsample', 2], ['subsample', 2], ['']],
+                 distillation=False):
+        super().__init__()
+
+        # --- SHARED STEM ---
+        self.patch_embed = nn.Sequential(
+            Conv2d_BN(in_chans, embed_dim[0] // 8, 3, 2, 1), nn.ReLU(),
+            Conv2d_BN(embed_dim[0] // 8, embed_dim[0] // 4, 3, 2, 1), nn.ReLU(),
+            Conv2d_BN(embed_dim[0] // 4, embed_dim[0] // 2, 3, 2, 1), nn.ReLU(),
+            Conv2d_BN(embed_dim[0] // 2, embed_dim[0], 3, 2, 1)
+        )
+
+        # --- SHARED STAGE 1 ---
+        # FIX: Use a list and unpack to Sequential to get default keys "0", "1", ...
+        blocks1_layers = []
+        for d in range(depth[0]):
+            blocks1_layers.append(BasicBlock(embed_dim[0], qk_dim[0], partial_dim[0], types[0]))
+        self.blocks1 = nn.Sequential(*blocks1_layers)
+
+        # --- BRANCH A (Head A) ---
+        self.ds_1_to_2_A = self._make_downsample(embed_dim, 0)
+        self.blocks2_A = self._make_stage(embed_dim[1], qk_dim[1], partial_dim[1], depth[1], types[1])
+        
+        self.ds_2_to_3_A = self._make_downsample(embed_dim, 1)
+        self.blocks3_A = self._make_stage(embed_dim[2], qk_dim[2], partial_dim[2], depth[2], types[2])
+
+        # --- BRANCH B (Head B) ---
+        self.ds_1_to_2_B = self._make_downsample(embed_dim, 0)
+        self.blocks2_B = self._make_stage(embed_dim[1], qk_dim[1], partial_dim[1], depth[1], types[1])
+        
+        self.ds_2_to_3_B = self._make_downsample(embed_dim, 1)
+        self.blocks3_B = self._make_stage(embed_dim[2], qk_dim[2], partial_dim[2], depth[2], types[2])
+
+        # --- BRANCH C (Head C) ---
+        self.ds_1_to_2_C = self._make_downsample(embed_dim, 0)
+        self.blocks2_C = self._make_stage(embed_dim[1], qk_dim[1], partial_dim[1], depth[1], types[1])
+        
+        self.ds_2_to_3_C = self._make_downsample(embed_dim, 1)
+        self.blocks3_C = self._make_stage(embed_dim[2], qk_dim[2], partial_dim[2], depth[2], types[2])
+
+        # --- FUSION / ROUTER ---
+        self.router = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(embed_dim[0], 3)
+        )
         self.head = BN_Linear(embed_dim[-1], num_classes) if num_classes > 0 else nn.Identity()
 
     def _make_downsample(self, embed_dim, idx):
@@ -448,8 +558,21 @@ class DoubleHeadSHViT(nn.Module):
         xB = self.ds_2_to_3_B(xB)
         xB = self.blocks3_B(xB)
 
-        x_cat = torch.cat([xA, xB], dim=1)
-        x_fused = self.fusion_conv(x_cat)
+        # Branch C
+        xC = self.ds_1_to_2_C(x)
+        xC = self.blocks2_C(xC)
+        xC = self.ds_2_to_3_C(xC)
+        xC = self.blocks3_C(xC)
+
+        # Routing
+        x_shared_pool = self.router(x) # x is the output of blocks1
+        routing_weights = torch.nn.functional.softmax(x_shared_pool, dim=-1)
+
+        wA = routing_weights[:, 0].view(-1, 1, 1, 1)
+        wB = routing_weights[:, 1].view(-1, 1, 1, 1)
+        wC = routing_weights[:, 2].view(-1, 1, 1, 1)
+
+        x_fused = wA * xA + wB * xB + wC * xC
         
         x_out = torch.nn.functional.adaptive_avg_pool2d(x_fused, 1).flatten(1)
         x_out = self.head(x_out)

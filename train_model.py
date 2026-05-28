@@ -144,13 +144,17 @@ def freeze_stage_1(model):
 
 def build_and_load_monster(original_shvit, num_classes=1000, model_cfg=None):
     if model_cfg is None: model_cfg = {}
-    print("Building DoubleHeadSHViT...")
+    print("Building DoubleHeadSHViT (Diversified Ensemble)...")
     monster = DoubleHeadSHViT(num_classes=num_classes, **model_cfg)
     
     print(" - Copying Shared Stem and Stage 1...")
     monster.patch_embed.load_state_dict(original_shvit.patch_embed.state_dict())
     monster.blocks1.load_state_dict(original_shvit.blocks1.state_dict())
-    monster.head.load_state_dict(original_shvit.head.state_dict())
+    
+    # Copy pretrained head to BOTH branch heads
+    print(" - Copying classification head to both head_A and head_B...")
+    monster.head_A.load_state_dict(original_shvit.head.state_dict())
+    monster.head_B.load_state_dict(original_shvit.head.state_dict())
     
     print(" - Duplicating Stage 2 and 3 to both heads...")
 
@@ -170,7 +174,8 @@ def build_and_load_monster(original_shvit, num_classes=1000, model_cfg=None):
     
     copy_params(src_ds_2, monster.ds_1_to_2_B)
     copy_params(src_blks_2, monster.blocks2_B)
-    for param in monster.blocks2_B.parameters(): param.data += torch.randn_like(param) * 1e-4
+    # Stronger noise (1e-2) for meaningful symmetry breaking
+    for param in monster.blocks2_B.parameters(): param.data += torch.randn_like(param) * 1e-2
 
     # --- Stage 3 ---
     src_ds_3 = [original_shvit.blocks3[i] for i in range(3)]
@@ -181,7 +186,8 @@ def build_and_load_monster(original_shvit, num_classes=1000, model_cfg=None):
     
     copy_params(src_ds_3, monster.ds_2_to_3_B)
     copy_params(src_blks_3, monster.blocks3_B)
-    for param in monster.blocks3_B.parameters(): param.data += torch.randn_like(param) * 1e-4
+    # Stronger noise (1e-2) for meaningful symmetry breaking
+    for param in monster.blocks3_B.parameters(): param.data += torch.randn_like(param) * 1e-2
     
     print("Monster initialized successfully!")
     return monster
@@ -206,14 +212,20 @@ def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda', mod
         state_dict = checkpoint["model"]
     else:
         state_dict = checkpoint
-        
-    monster.load_state_dict(state_dict, strict=False)
     
-    # If the user requested a different number of classes, replace the head
+    # Handle both old (router+head) and new (head_A+head_B) checkpoint formats
+    missing, unexpected = monster.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Missing keys (expected for format change): {len(missing)} keys")
+    if unexpected:
+        print(f"  Unexpected keys (from old format): {len(unexpected)} keys")
+    
+    # If the user requested a different number of classes, replace both heads
     if num_classes != 1000:
-        print(f"Modifying head: 1000 -> {num_classes} classes")
-        in_features = monster.head.l.in_features
-        monster.head = BN_Linear(in_features, num_classes)
+        print(f"Modifying heads: 1000 -> {num_classes} classes")
+        in_features = monster.head_A.l.in_features
+        monster.head_A = BN_Linear(in_features, num_classes)
+        monster.head_B = BN_Linear(in_features, num_classes)
         
     monster.to(device)
     monster.eval()
@@ -607,7 +619,7 @@ def train_model_base(model, train_loader, val_loader, model_name, SAVE_DIR,num_e
     model.load_state_dict(best_model_wts)
     return model
 
-def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name):
+def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name, resume_checkpoint=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     shvit_name = 's1'
@@ -647,16 +659,39 @@ def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eva
 
     # 4. Setup Training
     param_groups = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = torch.optim.AdamW(param_groups, lr=1e-4, weight_decay=0.1)
+    optimizer = torch.optim.AdamW(param_groups, lr=1e-4, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     criterion = torch.nn.CrossEntropyLoss()
-    scaler = NativeScaler() 
+    scaler = NativeScaler()
+    diversity_lambda = 0.5  # Weight for diversity loss
 
-    print("Starting Fine-tuning...")
+    start_epoch = 0
     best_acc = 0.0
-    for epoch in range(NUM_EPOCHS):
+
+    if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_acc' in checkpoint:
+                best_acc = checkpoint['best_acc']
+        else:
+            model.load_state_dict(checkpoint)
+            print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
+
+    print("Starting Fine-tuning (Diversified Ensemble)...")
+    for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         total_loss = 0
+        total_diversity = 0
         num_steps = 0
 
         for batch_idx, (input, target) in enumerate(loader_train):
@@ -667,12 +702,19 @@ def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eva
             # AMP Context
             with torch.cuda.amp.autocast():
                 output_tuple = model(input)
-                if isinstance(output_tuple, tuple):
+                if isinstance(output_tuple, tuple) and len(output_tuple) == 4:
+                    # Diversified Ensemble: (logits_A, logits_B, feat_A, feat_B)
+                    logits_A, logits_B, feat_A, feat_B = output_tuple
+                    loss_A = criterion(logits_A, target)
+                    loss_B = criterion(logits_B, target)
+                    # Diversity loss: push features to be ORTHOGONAL (minimize squared cosine similarity)
+                    diversity = (F.cosine_similarity(feat_A, feat_B, dim=1) ** 2).mean()
+                    loss = loss_A + loss_B + diversity_lambda * diversity
+                    total_diversity += diversity.item()
+                elif isinstance(output_tuple, tuple) and len(output_tuple) == 2:
+                    # Legacy MoE format fallback
                     output, routing_weights = output_tuple
-                    loss_ce = criterion(output, target)
-                    mean_routing = routing_weights.mean(dim=0)
-                    loss_bal = torch.var(mean_routing) * mean_routing.size(0)
-                    loss = loss_ce + 0.1 * loss_bal
+                    loss = criterion(output, target)
                 else:
                     output = output_tuple
                     loss = criterion(output, target)
@@ -683,16 +725,26 @@ def train_monster(use_shvit, num_heads, model_location, loader_train, loader_eva
             num_steps += 1
 
             if batch_idx % 100 == 0:
-                print(f"Epoch {epoch}: Step {batch_idx} Loss {loss.item():.4f}")
+                div_str = f" | Diversity: {diversity.item():.4f}" if isinstance(output_tuple, tuple) and len(output_tuple) == 4 else ""
+                print(f"Epoch {epoch}: Step {batch_idx} Loss {loss.item():.4f}{div_str}")
         scheduler.step()
         # Validation
         acc = validate(model, loader_eval, device)
-        print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
+        avg_div = total_diversity / max(num_steps, 1)
+        print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Avg Diversity: {avg_div:.4f} | Val Acc: {acc:.2f}%")
 
         # Save Checkpoint
-        if acc > best_acc or epoch%20==0:
+        if acc > best_acc or epoch % 20 == 0:
             best_acc = acc
-            torch.save(model.state_dict(), str(epoch)+"_"+output_file_name)
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'best_acc': best_acc
+            }
+            torch.save(checkpoint_dict, str(epoch) + "_" + output_file_name)
             print(f"Saved model with acc {acc:.2f}%")
             
     return model

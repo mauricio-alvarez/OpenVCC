@@ -28,7 +28,7 @@ if __name__ == '__main__':
     thvit_s1 = "/home/mauricio.alvarez/tesis/VCC/4_shvit_s1_triplehead_0405_150epochs.pth"
     #thvit_s4 = "/home/mauricio.alvarez/tesis/VCC/model_weights/DoubleHeadViT/shvit_s1_triplehead_2704_150epochs.pth"
     #dhvit_s1 = "/home/mauricio.alvarez/tesis/VCC/model_weights/DoubleHeadViT/shvit_s1_doublehead_0103_300epochs_pretrained.pth"
-    dhvit_s1 = "/home/mauricio.alvarez/tesis/VCC/7_shvit_s1_improved_0905_150epochs.pth"
+    dhvit_s1 = "/home/mauricio.alvarez/tesis/VCC/42_shvit_s1_doublehead_1805_100epochs.pth"
     #dhvit_s4 = "/home/mauricio.alvarez/tesis/VCC/20_shvit_s4_doublehead_0405_150epochs.pth"
     dhvit_s4 = "/home/mauricio.alvarez/tesis/VCC/3_shvit_s4_doublehead_0405_150epochs.pth"
     
@@ -44,21 +44,21 @@ if __name__ == '__main__':
         os.makedirs(SAVE_DIR)
         print(f"Created directory: {SAVE_DIR}")
     # Train a model: Vit Base and Large
-    train_loader, val_loader = data_loader(IMAGES_DIR, batch_size, seed_worker, 0.7)
-    #print(f"Model Using: {shvit_s4} Double-Head)")
-    #model = build_shvit('s1', shvit_s1, NUM_CLASS)
-    #model = build_timm(vit_base, NUM_CLASS)
-    #model = build_pruned(vit_small, vit_small_pruned)
-    #model = load_finetuned_monster(dhvit_s1, num_classes=NUM_CLASS, device=device)
+    #train_loader, val_loader = data_loader(IMAGES_DIR, batch_size, seed_worker, 0.7)
+    #print(f"Model Using: {vit_small} Pruned")
+    #model = build_shvit('s4', shvit_s4, NUM_CLASS)
+    #model = build_timm(vit_small, NUM_CLASS)
+    #model = build_pruned(vit_base, vit_base_pruned)
+    model = load_finetuned_monster(dhvit_s1, num_classes=NUM_CLASS, device=device)
     #model = load_finetuned_triple_monster(thvit_s1, num_classes=NUM_CLASS, device=device)
-    #model.to(device)
+    model.to(device)
     #print(model)
     #model_finetuned = train_model_base(model, train_loader, val_loader, 'ViT-B16', SAVE_DIR=SAVE_DIR,num_epochs=5)
     #model_finetuned = train_model_timm(model, train_loader, val_loader, 'ViT-Large', SAVE_DIR=SAVE_DIR,num_epochs=5)
-    model = train_monster_improved(True,2, shvit_s1, train_loader, val_loader, NUM_CLASS, 5, 'shvit_s1_doublehead_1405_150epochs.pth')
+    #model = train_monster(True,2, shvit_s1, train_loader, val_loader, NUM_CLASS, 50, 'shvit_s1_doublehead_1805_100epochs.pth', resume_checkpoint=dhvit_s1)
 
-    #test_imagenet_r(model)
-    #test_imagenet_1k(model, set_name='val')
+    test_imagenet_r(model)
+    test_imagenet_1k(model, set_name='val')
     #model_finetuned = train_monster(shvit_s1, train_loader, val_loader, 50)
     '''
     ckpt = '/home/mauricio.alvarez/tesis/VCC/13_shvit_s1_improved_0905_150epochs.pth'

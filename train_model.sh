@@ -9,7 +9,7 @@
 #SBATCH --mem=64G             # Memory request (32G is safe for a 'base' model)
 #SBATCH --gres=gpu:1      # Request 1 RTX A6000 GPU (g002)
 #SBATCH --nodelist=g001            # Target the g002 node specifically
-#SBATCH --time=66:00:00
+#SBATCH --time=69:00:00
 #SBATCH -o vcc_train_out_%j.log  # File for standard output
 #SBATCH -e vcc_train_err_%j.log  # File for standard error
 
