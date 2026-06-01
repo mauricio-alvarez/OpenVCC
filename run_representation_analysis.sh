@@ -40,7 +40,7 @@ IMAGENET200_ROOT="${PROJECT_DIR}/imagenet_val_for_imagenet_r"
 IMAGENET_VAL_ROOT="/home/mauricio.alvarez/tesis/archive/imagenet-val/imagenet-val"
 IMAGENETR_ROOT="/home/mauricio.alvarez/tesis/archive/imagenet-r"
 
-CLASS_FILE="${PROJECT_DIR}/imagenet_r_16_classes.txt"
+CLASS_FILE="${PROJECT_DIR}/imagenet_r_200_classes.txt"
 OUT_ROOT="${PROJECT_DIR}/analysis/representation"
 
 BATCH_SIZE=64
@@ -132,7 +132,10 @@ python analyze_representations.py \
   --shift-dataset imagenetr \
   --output-dir "${OUT_ROOT}/results" \
   --max-metric-samples 8000 \
-  --max-plot-samples 3000
+  --max-plot-samples 3000 \
+  --linear-probe \
+  --shvit-checkpoint "${SHVIT_CKPT}" \
+  --dhvit-checkpoint "${DHVIT_CKPT}"
 
 echo "Representation analysis job finished at $(date)"
 

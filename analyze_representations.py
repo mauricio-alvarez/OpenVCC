@@ -338,6 +338,120 @@ def plot_pca(path, title, X, y, class_names, max_samples, seed):
     plt.close()
 
 
+def compare_bn_buffers(shvit_ckpt_path, dhvit_ckpt_path, output_dir):
+    if not shvit_ckpt_path or not dhvit_ckpt_path:
+        print("Skipping BatchNorm buffer comparison: checkpoint paths not provided.")
+        return []
+    
+    import torch
+    
+    print(f"Comparing BatchNorm buffers between:\n  SHViT: {shvit_ckpt_path}\n  DHViT: {dhvit_ckpt_path}")
+    
+    try:
+        shvit_state = torch.load(shvit_ckpt_path, map_location="cpu")
+        dhvit_state = torch.load(dhvit_ckpt_path, map_location="cpu")
+    except Exception as e:
+        print(f"Error loading checkpoints for BatchNorm comparison: {e}")
+        return []
+        
+    if "model" in shvit_state:
+        shvit_state = shvit_state["model"]
+    if "model" in dhvit_state:
+        dhvit_state = dhvit_state["model"]
+        
+    rows = []
+    # We want to find keys in shvit_state that belong to patch_embed or blocks1 and are bn buffers.
+    # Specifically: running_mean, running_var
+    for key in sorted(shvit_state.keys()):
+        if not (key.startswith("patch_embed.") or key.startswith("blocks1.")):
+            continue
+        if not (key.endswith(".running_mean") or key.endswith(".running_var")):
+            continue
+            
+        if key not in dhvit_state:
+            print(f"Warning: Key {key} found in SHViT but not in DHViT")
+            continue
+            
+        val_sh = shvit_state[key].cpu().numpy()
+        val_dh = dhvit_state[key].cpu().numpy()
+        
+        if val_sh.shape != val_dh.shape:
+            print(f"Warning: Shape mismatch for {key}: SHViT {val_sh.shape} vs DHViT {val_dh.shape}")
+            continue
+            
+        l1_diff = float(np.mean(np.abs(val_sh - val_dh)))
+        l2_diff = float(np.sqrt(np.mean((val_sh - val_dh) ** 2)))
+        max_diff = float(np.max(np.abs(val_sh - val_dh)))
+        
+        rows.append({
+            "key": key,
+            "shape": str(list(val_sh.shape)),
+            "shvit_mean": float(np.mean(val_sh)),
+            "dhvit_mean": float(np.mean(val_dh)),
+            "l1_diff": l1_diff,
+            "l2_diff": l2_diff,
+            "max_diff": max_diff,
+        })
+        
+    if rows:
+        write_csv(Path(output_dir) / "bn_buffer_comparison.csv", list(rows[0].keys()), rows)
+        print(f"BatchNorm buffer comparison saved to {Path(output_dir) / 'bn_buffer_comparison.csv'}")
+    return rows
+
+
+def compute_per_class_accuracy(shvit, dhvit, dataset_name, output_dir):
+    if "logits" not in shvit or "logits_ensemble" not in dhvit:
+        print(f"Skipping per-class accuracy comparison for {dataset_name}: missing logits.")
+        return []
+        
+    y_true = shvit["targets_imagenet"]
+    class_names = np.asarray(shvit["class_names"])
+    
+    sh_preds = shvit["logits"].argmax(axis=1)
+    dh_preds = dhvit["logits_ensemble"].argmax(axis=1)
+    
+    unique_classes = sorted(list(set(class_names)))
+    rows = []
+    for cls in unique_classes:
+        mask = class_names == cls
+        if not np.any(mask):
+            continue
+            
+        cls_true = y_true[mask]
+        cls_sh_pred = sh_preds[mask]
+        cls_dh_pred = dh_preds[mask]
+        
+        # Only compute if we have valid targets (>= 0)
+        valid = cls_true >= 0
+        if not np.any(valid):
+            continue
+            
+        cls_true = cls_true[valid]
+        cls_sh_pred = cls_sh_pred[valid]
+        cls_dh_pred = cls_dh_pred[valid]
+        
+        sh_acc = float(np.mean(cls_sh_pred == cls_true))
+        dh_acc = float(np.mean(cls_dh_pred == cls_true))
+        loss = sh_acc - dh_acc
+        
+        rows.append({
+            "dataset": dataset_name,
+            "class_name": cls,
+            "num_samples": int(len(cls_true)),
+            "shvit_acc": sh_acc,
+            "dhvit_acc": dh_acc,
+            "dhvit_loss": loss, # positive means DHViT performed worse than SHViT
+        })
+        
+    # Sort by loss descending (classes that lose the most first)
+    rows = sorted(rows, key=lambda x: x["dhvit_loss"], reverse=True)
+    
+    if rows:
+        write_csv(Path(output_dir) / f"per_class_accuracy_{dataset_name}.csv", list(rows[0].keys()), rows)
+        print(f"Per-class accuracy comparison for {dataset_name} saved to {Path(output_dir) / f'per_class_accuracy_{dataset_name}.csv'}")
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze saved SHViT/DHViT representation vectors.")
     parser.add_argument("--input-root", default="analysis/representation")
@@ -348,6 +462,8 @@ def main():
     parser.add_argument("--max-plot-samples", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--linear-probe", action="store_true")
+    parser.add_argument("--shvit-checkpoint", default=None)
+    parser.add_argument("--dhvit-checkpoint", default=None)
     args = parser.parse_args()
 
     input_root = Path(args.input_root)
@@ -419,6 +535,29 @@ def main():
                 args.max_plot_samples,
                 args.seed,
             )
+        if "feat_A" in dhvit:
+            plot_pca(
+                figure_dir / f"pca_dhvit_{dataset_name}_feat_A.png",
+                f"DHViT branch A features - {dataset_name}",
+                dhvit["feat_A"],
+                dhvit["labels_local"],
+                dhvit["class_names"],
+                args.max_plot_samples,
+                args.seed,
+            )
+        if "feat_B" in dhvit:
+            plot_pca(
+                figure_dir / f"pca_dhvit_{dataset_name}_feat_B.png",
+                f"DHViT branch B features - {dataset_name}",
+                dhvit["feat_B"],
+                dhvit["labels_local"],
+                dhvit["class_names"],
+                args.max_plot_samples,
+                args.seed,
+            )
+
+        # Compute per-class accuracy
+        compute_per_class_accuracy(shvit, dhvit, dataset_name, output_dir)
 
     if cka_rows:
         write_csv(output_dir / "cka_shvit_vs_dhvit.csv", list(cka_rows[0].keys()), cka_rows)
@@ -454,6 +593,9 @@ def main():
         )
     if centroid_rows:
         write_csv(output_dir / "centroid_shift.csv", list(centroid_rows[0].keys()), centroid_rows)
+
+    if args.shvit_checkpoint and args.dhvit_checkpoint:
+        compare_bn_buffers(args.shvit_checkpoint, args.dhvit_checkpoint, output_dir)
 
     print(f"Analysis complete. Results saved to {output_dir}")
 
