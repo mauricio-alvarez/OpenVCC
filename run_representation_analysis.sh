@@ -32,7 +32,7 @@ export HF_HUB_OFFLINE=1
 #----------------------------------------------------------------#
 
 SHVIT_CKPT="${PROJECT_DIR}/model_weights/SHViT/shvit_s1.pth"
-DHVIT_CKPT="${PROJECT_DIR}/122_shvit_s1_doublehead_1805_100epochs.pth"
+DHVIT_CKPT="${PROJECT_DIR}/88_shvit_s1_doublehead_1805_100epochs.pth"
 
 # ImageNet-200 should be a folder with ImageNet-R WNID class subfolders from ImageNet val.
 # If you already ran test_imagenet_r(), this may exist as ./imagenet_val_for_imagenet_r.

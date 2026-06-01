@@ -1,0 +1,23 @@
+Representation analysis job started on g001 at Mon Jun  1 12:14:11 -05 2026
+SHViT checkpoint: /home/mauricio.alvarez/tesis/VCC/model_weights/SHViT/shvit_s1.pth
+DHViT checkpoint: /home/mauricio.alvarez/tesis/VCC/88_shvit_s1_doublehead_1805_100epochs.pth
+ImageNet-200 root: /home/mauricio.alvarez/tesis/VCC/imagenet_val_for_imagenet_r
+ImageNet val root: /home/mauricio.alvarez/tesis/archive/imagenet-val/imagenet-val
+ImageNet-R root: /home/mauricio.alvarez/tesis/archive/imagenet-r
+Class file: /home/mauricio.alvarez/tesis/VCC/imagenet_r_16_classes.txt
+Output root: /home/mauricio.alvarez/tesis/VCC/analysis/representation
+Ensuring ImageNet-200 symlinks exist at /home/mauricio.alvarez/tesis/VCC/imagenet_val_for_imagenet_r
+Using device: cuda
+Loaded 800 images across 16 requested classes.
+Saved representation files to /home/mauricio.alvarez/tesis/VCC/analysis/representation/shvit/imagenet200
+Using device: cuda
+Loaded 800 images across 16 requested classes.
+Saved representation files to /home/mauricio.alvarez/tesis/VCC/analysis/representation/dhvit/imagenet200
+Using device: cuda
+Loaded 800 images across 16 requested classes.
+Saved representation files to /home/mauricio.alvarez/tesis/VCC/analysis/representation/shvit/imagenetr
+Using device: cuda
+Loaded 800 images across 16 requested classes.
+Saved representation files to /home/mauricio.alvarez/tesis/VCC/analysis/representation/dhvit/imagenetr
+Analysis complete. Results saved to /home/mauricio.alvarez/tesis/VCC/analysis/representation/results
+Representation analysis job finished at Mon Jun  1 12:18:50 -05 2026

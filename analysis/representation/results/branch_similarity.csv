@@ -1,0 +1,5 @@
+agreement_rate,branch_a_acc,branch_b_acc,comparison,dataset,ensemble_acc,ensemble_fixes_branch_error,linear_cka,mean_pairwise_cosine,mse,oracle_branch_acc
+,,,feat_A_vs_feat_B,imagenet200,,,0.7148097688291369,-0.001084708608686924,76.82099151611328,
+0.93375,0.75625,0.76,predictions,imagenet200,0.7575,0.015,,,,0.77375
+,,,feat_A_vs_feat_B,imagenetr,,,0.7819368207049892,-0.0008963453583419323,77.3271255493164,
+0.79875,0.23625,0.2425,predictions,imagenetr,0.24,0.01375,,,,0.2525
