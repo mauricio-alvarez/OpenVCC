@@ -15,6 +15,8 @@ from representation_extract import (
     get_model_cfg,
     load_imagenet_index,
     read_class_names,
+    build_shvit_model,
+    forward_shvit,
 )
 from SHViT import DoubleHeadSHViT
 from torch.utils.data import DataLoader
@@ -130,7 +132,29 @@ def load_dhvit_model(checkpoint_path, model_size, num_classes, device):
     return model
 
 
-def extract_dhvit_features(args, checkpoint_path):
+def load_shvit_model(checkpoint_path, model_size, num_classes, device):
+    model = build_shvit_model(model_size, num_classes)
+    _, state_dict, _ = load_checkpoint(checkpoint_path, map_location=device)
+    model_state = model.state_dict()
+    adjusted = {}
+    for key, value in state_dict.items():
+        if key in model_state and model_state[key].shape != value.shape:
+            value = maybe_expand_conv_weight(value, model_state[key])
+            if model_state[key].shape != value.shape:
+                print(f"Skipping shape-mismatched key {key}: {tuple(value.shape)} vs {tuple(model_state[key].shape)}")
+                continue
+        adjusted[key] = value
+    missing, unexpected = model.load_state_dict(adjusted, strict=False)
+    if missing:
+        print(f"Missing keys while loading SHViT: {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys while loading SHViT: {len(unexpected)}")
+    model.to(device)
+    model.eval()
+    return model
+
+
+def extract_features(args, checkpoint_path, model_kind="dhvit"):
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     wnid_to_idx, _ = load_imagenet_index(args.imagenet_index)
     class_names = read_class_names(args, args.dataset_root)
@@ -151,8 +175,14 @@ def extract_dhvit_features(args, checkpoint_path):
         collate_fn=collate_batch,
     )
 
-    print(f"Extracting DHViT activations from {len(dataset)} images on {device}.")
-    model = load_dhvit_model(checkpoint_path, args.model_size, args.num_classes, device)
+    print(f"Extracting {model_kind.upper()} activations from {len(dataset)} images on {device}.")
+    if model_kind == "dhvit":
+        model = load_dhvit_model(checkpoint_path, args.model_size, args.num_classes, device)
+        forward_fn = forward_dhvit
+    else:
+        model = load_shvit_model(checkpoint_path, args.model_size, args.num_classes, device)
+        forward_fn = forward_shvit
+
     storage = {}
     labels = []
     targets = []
@@ -160,16 +190,16 @@ def extract_dhvit_features(args, checkpoint_path):
     sample_classes = []
 
     with torch.no_grad():
-        for images, labels_local, targets_imagenet, batch_paths, batch_classes in tqdm(loader, desc="Extracting"):
+        for images, labels_local, targets_imagenet, batch_paths, batch_classes in tqdm(loader, desc=f"Extracting {model_kind.upper()}"):
             images = images.to(device, non_blocking=True)
-            outputs = forward_dhvit(model, images)
+            outputs = forward_fn(model, images)
             append_outputs(storage, outputs)
             labels.extend(labels_local.numpy().tolist())
             targets.extend(targets_imagenet.numpy().tolist())
             paths.extend(batch_paths)
             sample_classes.extend(batch_classes)
 
-    output_dir = Path(args.activation_output_dir)
+    output_dir = Path(args.activation_output_dir) / model_kind
     output_dir.mkdir(parents=True, exist_ok=True)
     for key, arrays in storage.items():
         np.save(output_dir / f"{key}.npy", np.concatenate(arrays, axis=0).astype(np.float32))
@@ -179,13 +209,13 @@ def extract_dhvit_features(args, checkpoint_path):
         f.write("\n".join(sample_classes))
     with open(output_dir / "paths.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(paths))
-    print(f"Saved extracted activation files to {output_dir}")
+    print(f"Saved extracted activation files for {model_kind} to {output_dir}")
     return output_dir
 
 
-def load_plot_inputs(args, activation_dir):
+def load_plot_inputs(activation_dir, feature_key):
     activation_dir = Path(activation_dir)
-    feature_path = activation_dir / f"{args.feature_key}.npy"
+    feature_path = activation_dir / f"{feature_key}.npy"
     if not feature_path.exists():
         raise FileNotFoundError(f"Feature file not found: {feature_path}")
 
@@ -208,15 +238,15 @@ def subsample_for_umap(X, y, class_names, max_points, seed):
     return X[indices], y[indices], [class_names[i] for i in indices]
 
 
-def plot_umap_3d(args, activation_dir):
+def plot_umap_3d(args, activation_dir, feature_key, title, output_path):
     import pandas as pd
     import plotly.express as px
     import umap
 
-    X, y, per_sample_names = load_plot_inputs(args, activation_dir)
+    X, y, per_sample_names = load_plot_inputs(activation_dir, feature_key)
     X, y, per_sample_names = subsample_for_umap(X, y, per_sample_names, args.max_umap_points, args.seed)
 
-    print(f"Running 3D UMAP for {len(X)} points from feature '{args.feature_key}'.")
+    print(f"Running 3D UMAP for {len(X)} points from feature '{feature_key}'.")
     reducer = umap.UMAP(
         n_components=3,
         n_neighbors=args.umap_neighbors,
@@ -242,12 +272,12 @@ def plot_umap_3d(args, activation_dir):
         z="umap_z",
         color="class_name",
         hover_data=["label_id", "class_name"],
-        title=f"3D UMAP of DHViT {args.feature_key}",
+        title=title,
         opacity=0.72,
     )
     fig.update_traces(marker=dict(size=args.marker_size))
 
-    output_html = Path(args.umap_output)
+    output_html = Path(output_path)
     output_html.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(output_html)
     np.save(output_html.with_suffix(".embedding.npy"), embedding.astype(np.float32))
@@ -266,6 +296,7 @@ def main():
     parser.add_argument("--num-classes", type=int, default=1000)
 
     parser.add_argument("--plot-umap", action="store_true")
+    parser.add_argument("--plot-shvit-umap", action="store_true", help="Also plot the UMAP of the original SHViT architecture.")
     parser.add_argument("--activation-dir", default=None, help="Existing activation directory to plot from.")
     parser.add_argument("--activation-output-dir", default="analysis/repaired_stage1_umap")
     parser.add_argument("--dataset-root", default=None)
@@ -280,25 +311,67 @@ def main():
     parser.add_argument("--device", default="cuda")
 
     parser.add_argument("--feature-key", default="feat_mean", choices=["feat_A", "feat_B", "feat_mean", "logits_ensemble"])
+    parser.add_argument("--shvit-feature-key", default="pooled", choices=["patch_embed", "blocks1", "blocks2", "blocks3", "pooled", "logits"])
     parser.add_argument("--umap-output", default="analysis/repaired_stage1_umap/dhvit_repaired_feat_mean_umap3d.html")
+    parser.add_argument("--shvit-umap-output", default="analysis/repaired_stage1_umap/shvit_pooled_umap3d.html")
     parser.add_argument("--max-umap-points", type=int, default=10000)
     parser.add_argument("--umap-neighbors", type=int, default=30)
     parser.add_argument("--umap-min-dist", type=float, default=0.1)
     parser.add_argument("--umap-metric", default="cosine")
     parser.add_argument("--marker-size", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-repaired", action="store_true", help="Run ImageNet-1K and ImageNet-R evaluation functions from train_model.py")
     args = parser.parse_args()
 
     repair_checkpoint(args)
 
     if args.plot_umap:
+        # Plot DHViT UMAP
         if args.activation_dir:
-            activation_dir = Path(args.activation_dir)
+            dhvit_activation_dir = Path(args.activation_dir)
+            if (dhvit_activation_dir / "dhvit").exists():
+                dhvit_activation_dir = dhvit_activation_dir / "dhvit"
         else:
             if not args.dataset_root:
                 raise ValueError("--dataset-root is required when --plot-umap is used without --activation-dir")
-            activation_dir = extract_dhvit_features(args, args.output_checkpoint)
-        plot_umap_3d(args, activation_dir)
+            dhvit_activation_dir = extract_features(args, args.output_checkpoint, model_kind="dhvit")
+        
+        plot_umap_3d(
+            args,
+            dhvit_activation_dir,
+            feature_key=args.feature_key,
+            title=f"3D UMAP of DHViT {args.feature_key}",
+            output_path=args.umap_output
+        )
+
+        # Plot SHViT UMAP if requested
+        if args.plot_shvit_umap:
+            if args.activation_dir:
+                shvit_activation_dir = Path(args.activation_dir)
+                if (shvit_activation_dir / "shvit").exists():
+                    shvit_activation_dir = shvit_activation_dir / "shvit"
+            else:
+                shvit_activation_dir = extract_features(args, args.shvit_checkpoint, model_kind="shvit")
+            
+            plot_umap_3d(
+                args,
+                shvit_activation_dir,
+                feature_key=args.shvit_feature_key,
+                title=f"3D UMAP of SHViT {args.shvit_feature_key}",
+                output_path=args.shvit_umap_output
+            )
+
+    if args.eval_repaired:
+        print("\n--- Running Evaluation of Repaired Model on ImageNet-1K and ImageNet-R ---")
+        from train_model import test_imagenet_1k, test_imagenet_r
+        device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+        repaired_model = load_dhvit_model(args.output_checkpoint, args.model_size, args.num_classes, device)
+        
+        print("Running test_imagenet_1k...")
+        test_imagenet_1k(repaired_model, set_name="val", batch_size=args.batch_size, num_workers=args.num_workers)
+        
+        print("\nRunning test_imagenet_r...")
+        test_imagenet_r(repaired_model)
 
 
 if __name__ == "__main__":
