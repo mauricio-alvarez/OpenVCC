@@ -141,6 +141,46 @@ def freeze_stage_1(model):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model Frozen. Trainable Params: {trainable_params/1e6:.2f}M / {total_params/1e6:.2f}M")
+    model._stage1_frozen = True
+    keep_frozen_stage_1_eval(model)
+
+
+def keep_frozen_stage_1_eval(model):
+    """
+    Keep frozen stage-1 modules in eval mode so BatchNorm buffers do not drift
+    when the rest of the model is switched back to train mode.
+    """
+    for module_name in ("patch_embed", "blocks1"):
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        module.eval()
+        for child in module.modules():
+            if isinstance(child, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm)):
+                child.eval()
+
+
+def load_model_state_compatible(model, state_dict, label="model"):
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"{label}: missing keys while loading: {len(missing)}")
+        for key in missing[:10]:
+            print(f"  missing: {key}")
+        if len(missing) > 10:
+            print(f"  ... {len(missing) - 10} more")
+    if unexpected:
+        print(f"{label}: unexpected keys while loading: {len(unexpected)}")
+        for key in unexpected[:10]:
+            print(f"  unexpected: {key}")
+        if len(unexpected) > 10:
+            print(f"  ... {len(unexpected) - 10} more")
+
+
+def load_training_state_if_compatible(component, state_dict, label):
+    try:
+        component.load_state_dict(state_dict)
+    except ValueError as exc:
+        print(f"Skipping {label} state load because it is incompatible with the current model: {exc}")
 
 def build_and_load_monster(original_shvit, num_classes=1000, model_cfg=None):
     if model_cfg is None: model_cfg = {}
@@ -1311,14 +1351,27 @@ def test_imagenet_r(model):
     hook_handle.remove()
 
 
-def build_and_load_typhon(original_shvit, num_classes=1000, model_cfg=None, num_mixers=2):
+def build_and_load_typhon(
+    original_shvit,
+    num_classes=1000,
+    model_cfg=None,
+    num_mixers=2,
+    mixer_fusion="gated_sum",
+    use_merge_norm=False,
+):
     from SHViT import Typhon, TyphonBasicBlock
     import torch
     
     if model_cfg is None:
         model_cfg = {}
-    print(f"Building Typhon with {num_mixers} mixers...")
-    typhon = Typhon(num_classes=num_classes, num_mixers=num_mixers, **model_cfg)
+    print(f"Building Typhon with {num_mixers} mixers ({mixer_fusion})...")
+    typhon = Typhon(
+        num_classes=num_classes,
+        num_mixers=num_mixers,
+        mixer_fusion=mixer_fusion,
+        use_merge_norm=use_merge_norm,
+        **model_cfg,
+    )
     
     print(" - Copying Shared Stem...")
     typhon.patch_embed.load_state_dict(original_shvit.patch_embed.state_dict())
@@ -1331,6 +1384,49 @@ def build_and_load_typhon(original_shvit, num_classes=1000, model_cfg=None, num_
     
     print(" - Copying blocks and duplicating mixers...")
     
+    def copy_full_mixer(src_mixer, dest_blk):
+        src_mixer_state = {k: v for k, v in src_mixer.state_dict().items() if not k.startswith("proj")}
+        for mixer_idx in range(dest_blk.num_mixers):
+            dest_blk.mixers[mixer_idx].load_state_dict(src_mixer_state)
+            if mixer_idx > 0:
+                for param in dest_blk.mixers[mixer_idx].parameters():
+                    param.data += torch.randn_like(param.data) * 1e-4
+        with torch.no_grad():
+            dest_blk.mixer_gates.zero_()
+            dest_blk.mixer_gates[0] = 1.0
+
+    def copy_split_mixer(src_mixer, dest_blk):
+        src_qk_dim = src_mixer.qk_dim
+        p_start = 0
+        qk_start = 0
+        with torch.no_grad():
+            dest_blk.mixer_gates.fill_(1.0)
+            for mixer, head_dim, head_qk_dim in zip(dest_blk.mixers, dest_blk.head_dims, dest_blk.qk_dims):
+                index_device = src_mixer.qkv.c.weight.device
+                dest_device = mixer.qkv.c.weight.device
+                p_slice = slice(p_start, p_start + head_dim)
+                q_slice = slice(qk_start, qk_start + head_qk_dim)
+                k_slice = slice(src_qk_dim + qk_start, src_qk_dim + qk_start + head_qk_dim)
+                v_slice = slice(2 * src_qk_dim + p_start, 2 * src_qk_dim + p_start + head_dim)
+                out_indices = torch.cat([
+                    torch.arange(q_slice.start, q_slice.stop, device=index_device),
+                    torch.arange(k_slice.start, k_slice.stop, device=index_device),
+                    torch.arange(v_slice.start, v_slice.stop, device=index_device),
+                ]).long()
+
+                mixer.pre_norm.weight.copy_(src_mixer.pre_norm.weight[p_slice].to(dest_device))
+                mixer.pre_norm.bias.copy_(src_mixer.pre_norm.bias[p_slice].to(dest_device))
+
+                mixer.qkv.c.weight.copy_(src_mixer.qkv.c.weight[out_indices][:, p_slice].to(dest_device))
+                mixer.qkv.bn.weight.copy_(src_mixer.qkv.bn.weight[out_indices].to(dest_device))
+                mixer.qkv.bn.bias.copy_(src_mixer.qkv.bn.bias[out_indices].to(dest_device))
+                mixer.qkv.bn.running_mean.copy_(src_mixer.qkv.bn.running_mean[out_indices].to(dest_device))
+                mixer.qkv.bn.running_var.copy_(src_mixer.qkv.bn.running_var[out_indices].to(dest_device))
+                mixer.qkv.bn.num_batches_tracked.copy_(src_mixer.qkv.bn.num_batches_tracked.to(dest_device))
+
+                p_start += head_dim
+                qk_start += head_qk_dim
+
     def copy_stage(src_seq, dest_seq):
         for src_blk, dest_blk in zip(src_seq, dest_seq):
             if isinstance(dest_blk, TyphonBasicBlock):
@@ -1340,14 +1436,10 @@ def build_and_load_typhon(original_shvit, num_classes=1000, model_cfg=None, num_
                     dest_blk.ffn.load_state_dict(src_blk.ffn.state_dict())
                     # Copy shared projection layer
                     dest_blk.proj.load_state_dict(src_blk.mixer.m.proj.state_dict())
-                    # Copy the single mixer to all mixers in Typhon block (excl. proj)
-                    src_mixer_state = {k: v for k, v in src_blk.mixer.m.state_dict().items() if not k.startswith("proj")}
-                    for k in range(dest_blk.num_mixers):
-                        dest_blk.mixers[k].load_state_dict(src_mixer_state)
-                        # Add tiny noise for symmetry breaking
-                        if k > 0:
-                            for param in dest_blk.mixers[k].parameters():
-                                param.data += torch.randn_like(param.data) * 1e-4
+                    if dest_blk.mixer_fusion == "split_concat":
+                        copy_split_mixer(src_blk.mixer.m, dest_blk)
+                    else:
+                        copy_full_mixer(src_blk.mixer.m, dest_blk)
                 else:
                     # Early stage type 'i' block
                     dest_blk.load_state_dict(src_blk.state_dict())
@@ -1363,7 +1455,15 @@ def build_and_load_typhon(original_shvit, num_classes=1000, model_cfg=None, num_
     return typhon
 
 
-def load_finetuned_typhon(checkpoint_path, num_classes=1000, device='cuda', num_mixers=2, model_cfg=None):
+def load_finetuned_typhon(
+    checkpoint_path,
+    num_classes=1000,
+    device='cuda',
+    num_mixers=2,
+    model_cfg=None,
+    mixer_fusion="gated_sum",
+    use_merge_norm=False,
+):
     from SHViT import Typhon, SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
     import torch
     import os
@@ -1379,7 +1479,13 @@ def load_finetuned_typhon(checkpoint_path, num_classes=1000, device='cuda', num_
         else:
             model_cfg = SHViT_s1
             
-    model = Typhon(num_classes=num_classes, num_mixers=num_mixers, **model_cfg)
+    model = Typhon(
+        num_classes=num_classes,
+        num_mixers=num_mixers,
+        mixer_fusion=mixer_fusion,
+        use_merge_norm=use_merge_norm,
+        **model_cfg,
+    )
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model" in checkpoint:
@@ -1399,14 +1505,26 @@ def load_finetuned_typhon(checkpoint_path, num_classes=1000, device='cuda', num_
         else:
             filtered_state_dict[k] = v
 
-    model.load_state_dict(filtered_state_dict, strict=False)
+    load_model_state_compatible(model, filtered_state_dict, label="Typhon")
     model.to(device)
     model.eval()
     print("Typhon loaded successfully!")
     return model
 
 
-def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name, num_mixers=2, resume_checkpoint=None):
+def train_typhon(
+    use_shvit,
+    model_location,
+    loader_train,
+    loader_eval,
+    NUM_CLASS,
+    NUM_EPOCHS,
+    output_file_name,
+    num_mixers=2,
+    resume_checkpoint=None,
+    mixer_fusion="gated_sum",
+    use_merge_norm=False,
+):
     from SHViT import SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
     import torch
     import os
@@ -1429,9 +1547,24 @@ def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS
     if use_shvit:
         print(f"Loading original SHViT {shvit_name} to initialize Typhon...")
         original_model = build_shvit(shvit_name, model_location, classes_output=1000)
-        model = build_and_load_typhon(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg, num_mixers=num_mixers)
+        model = build_and_load_typhon(
+            original_model,
+            num_classes=NUM_CLASS,
+            model_cfg=model_cfg,
+            num_mixers=num_mixers,
+            mixer_fusion=mixer_fusion,
+            use_merge_norm=use_merge_norm,
+        )
     else:
-        model = load_finetuned_typhon(model_location, num_classes=NUM_CLASS, device=device, num_mixers=num_mixers, model_cfg=model_cfg)
+        model = load_finetuned_typhon(
+            model_location,
+            num_classes=NUM_CLASS,
+            device=device,
+            num_mixers=num_mixers,
+            model_cfg=model_cfg,
+            mixer_fusion=mixer_fusion,
+            use_merge_norm=use_merge_norm,
+        )
     
     freeze_stage_1(model)
     model.to(device)
@@ -1450,24 +1583,25 @@ def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS
         print(f"Resuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
+            load_model_state_compatible(model, checkpoint['model'], label="Typhon resume checkpoint")
             if 'optimizer' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
+                load_training_state_if_compatible(optimizer, checkpoint['optimizer'], "optimizer")
             if 'scheduler' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler'])
+                load_training_state_if_compatible(scheduler, checkpoint['scheduler'], "scheduler")
             if 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
+                load_training_state_if_compatible(scaler, checkpoint['scaler'], "scaler")
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
             if 'best_acc' in checkpoint:
                 best_acc = checkpoint['best_acc']
         else:
-            model.load_state_dict(checkpoint)
+            load_model_state_compatible(model, checkpoint, label="Typhon resume checkpoint")
             print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
 
     print("Starting Fine-tuning (Typhon)...")
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
+        keep_frozen_stage_1_eval(model)
         total_loss = 0
         num_steps = 0
 
@@ -1495,8 +1629,11 @@ def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS
         print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
 
         # Save Checkpoint
-        if acc > best_acc or epoch % 20 == 0:
+        is_best = acc > best_acc
+        should_save_periodic = epoch % 20 == 0
+        if is_best:
             best_acc = acc
+        if is_best or should_save_periodic:
             checkpoint_dict = {
                 'epoch': epoch,
                 'model': model.state_dict(),
@@ -1511,7 +1648,19 @@ def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS
     return model
 
 
-def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_name, batch_size=256, num_mixers=2, resume_checkpoint=None):
+def train_typhon_imagenet_1k(
+    use_shvit,
+    model_location,
+    NUM_EPOCHS,
+    output_file_name,
+    batch_size=256,
+    num_mixers=2,
+    resume_checkpoint=None,
+    mixer_fusion="gated_sum",
+    use_merge_norm=False,
+    distill_weight=0.0,
+    distill_temperature=2.0,
+):
     from SHViT import SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
     import torch
     import os
@@ -1535,12 +1684,31 @@ def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_
 
     # 1. Initialize or Load Typhon Model
     NUM_CLASS = 1000
+    teacher_model = None
     if use_shvit:
         print(f"Loading original SHViT {shvit_name} to initialize Typhon...")
         original_model = build_shvit(shvit_name, model_location, classes_output=1000)
-        model = build_and_load_typhon(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg, num_mixers=num_mixers)
+        model = build_and_load_typhon(
+            original_model,
+            num_classes=NUM_CLASS,
+            model_cfg=model_cfg,
+            num_mixers=num_mixers,
+            mixer_fusion=mixer_fusion,
+            use_merge_norm=use_merge_norm,
+        )
+        if distill_weight > 0:
+            teacher_model = original_model.to(device)
+            teacher_model.eval()
     else:
-        model = load_finetuned_typhon(model_location, num_classes=NUM_CLASS, device=device, num_mixers=num_mixers, model_cfg=model_cfg)
+        model = load_finetuned_typhon(
+            model_location,
+            num_classes=NUM_CLASS,
+            device=device,
+            num_mixers=num_mixers,
+            model_cfg=model_cfg,
+            mixer_fusion=mixer_fusion,
+            use_merge_norm=use_merge_norm,
+        )
     
     freeze_stage_1(model)
     model.to(device)
@@ -1598,24 +1766,25 @@ def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_
         print(f"Resuming from checkpoint: {resume_checkpoint}")
         checkpoint = torch.load(resume_checkpoint, map_location=device)
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
+            load_model_state_compatible(model, checkpoint['model'], label="Typhon resume checkpoint")
             if 'optimizer' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
+                load_training_state_if_compatible(optimizer, checkpoint['optimizer'], "optimizer")
             if 'scheduler' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler'])
+                load_training_state_if_compatible(scheduler, checkpoint['scheduler'], "scheduler")
             if 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
+                load_training_state_if_compatible(scaler, checkpoint['scaler'], "scaler")
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1
             if 'best_acc' in checkpoint:
                 best_acc = checkpoint['best_acc']
         else:
-            model.load_state_dict(checkpoint)
+            load_model_state_compatible(model, checkpoint, label="Typhon resume checkpoint")
             print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
 
     print("Starting Fine-tuning (Typhon on ImageNet-1K)...")
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
+        keep_frozen_stage_1_eval(model)
         total_loss = 0
         num_steps = 0
 
@@ -1627,6 +1796,16 @@ def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_
             with torch.cuda.amp.autocast():
                 output = model(input)
                 loss = criterion(output, target)
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        teacher_output = teacher_model(input)
+                    temperature = distill_temperature
+                    distill_loss = F.kl_div(
+                        F.log_softmax(output / temperature, dim=1),
+                        F.softmax(teacher_output / temperature, dim=1),
+                        reduction='batchmean',
+                    ) * (temperature ** 2)
+                    loss = loss + distill_weight * distill_loss
 
             scaler(loss, optimizer)
 
@@ -1642,8 +1821,11 @@ def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_
         print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
 
         # Save Checkpoint
-        if acc > best_acc or epoch % 10 == 0:
+        is_best = acc > best_acc
+        should_save_periodic = epoch % 10 == 0
+        if is_best:
             best_acc = acc
+        if is_best or should_save_periodic:
             checkpoint_dict = {
                 'epoch': epoch,
                 'model': model.state_dict(),

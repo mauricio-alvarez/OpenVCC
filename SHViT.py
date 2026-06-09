@@ -169,6 +169,13 @@ class SHSA(torch.nn.Module):
         return x
 
 
+def split_evenly(total, parts):
+    """Return channel split sizes that sum to total."""
+    base = total // parts
+    remainder = total % parts
+    return [base + (1 if i < remainder else 0) for i in range(parts)]
+
+
 class BasicBlock(torch.nn.Module):
     def __init__(self, dim, qk_dim, pdim, type):
         super().__init__()
@@ -186,7 +193,7 @@ class BasicBlock(torch.nn.Module):
 
 
 class TyphonAttention(torch.nn.Module):
-    """Mixer that performs Single-Head Self-Attention on input channels"""
+    """Single SHSA-style attention mixer used inside Typhon blocks."""
     def __init__(self, qk_dim, pdim):
         super().__init__()
         self.scale = qk_dim ** -0.5
@@ -210,17 +217,48 @@ class TyphonAttention(torch.nn.Module):
 
 
 class TyphonBasicBlock(torch.nn.Module):
-    def __init__(self, dim, qk_dim, pdim, type, num_mixers=1):
+    def __init__(
+        self,
+        dim,
+        qk_dim,
+        pdim,
+        type,
+        num_mixers=1,
+        mixer_fusion="gated_sum",
+        use_merge_norm=False,
+    ):
         super().__init__()
         self.type = type
         self.dim = dim
         self.pdim = pdim
         self.num_mixers = num_mixers
+        self.mixer_fusion = mixer_fusion
+        self.use_merge_norm = use_merge_norm
         
         self.conv = Residual(Conv2d_BN(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0))
         
         if type == "s":    # for later stages
-            self.mixers = torch.nn.ModuleList([TyphonAttention(qk_dim, pdim) for _ in range(num_mixers)])
+            if mixer_fusion not in ("gated_sum", "split_concat"):
+                raise ValueError(f"Unsupported Typhon mixer_fusion: {mixer_fusion}")
+
+            if mixer_fusion == "split_concat":
+                self.head_dims = split_evenly(pdim, num_mixers)
+                self.qk_dims = split_evenly(qk_dim, num_mixers)
+                self.mixers = torch.nn.ModuleList(
+                    TyphonAttention(head_qk_dim, head_dim)
+                    for head_qk_dim, head_dim in zip(self.qk_dims, self.head_dims)
+                )
+                self.mixer_gates = torch.nn.Parameter(torch.ones(num_mixers))
+            else:
+                self.head_dims = None
+                self.qk_dims = None
+                self.mixers = torch.nn.ModuleList([TyphonAttention(qk_dim, pdim) for _ in range(num_mixers)])
+                gate_init = torch.zeros(num_mixers)
+                gate_init[0] = 1.0
+                self.mixer_gates = torch.nn.Parameter(gate_init)
+
+            # Kept for optional legacy behavior/checkpoint compatibility. The
+            # default is off so gated_sum can reproduce SHViT at initialization.
             self.norm = GroupNorm(pdim)
             self.proj = torch.nn.Sequential(
                 torch.nn.ReLU(),
@@ -237,10 +275,25 @@ class TyphonBasicBlock(torch.nn.Module):
             # 1. Split active (x1) and passive (x2) channels
             x1, x2 = torch.split(x, [self.pdim, self.dim - self.pdim], dim=1)
             
-            # 2. Evaluate all mixers on x1 in parallel and sum their outputs
-            x1_merged = sum(mixer(x1) for mixer in self.mixers)
-            x1_merged = self.norm(x1_merged)
-            
+            # 2. Evaluate mixers. gated_sum is function-preserving with gates
+            # initialized as [1, 0, ...]. split_concat approximates MHA-style
+            # head separation by assigning each mixer a disjoint channel slice.
+            if self.mixer_fusion == "split_concat":
+                chunks = torch.split(x1, self.head_dims, dim=1)
+                outputs = [
+                    gate * mixer(chunk)
+                    for gate, mixer, chunk in zip(self.mixer_gates, self.mixers, chunks)
+                ]
+                x1_merged = torch.cat(outputs, dim=1)
+            else:
+                x1_merged = sum(
+                    gate * mixer(x1)
+                    for gate, mixer in zip(self.mixer_gates, self.mixers)
+                )
+
+            if self.use_merge_norm:
+                x1_merged = self.norm(x1_merged)
+             
             # 3. Concatenate back with the single bypassed x2 path
             x_cat = torch.cat([x1_merged, x2], dim=1)
             
@@ -326,7 +379,9 @@ class Typhon(torch.nn.Module):
                  types = ["s", "s", "s"],
                  down_ops=[['subsample', 2], ['subsample', 2], ['']],
                  distillation=False,
-                 num_mixers=2):
+                 num_mixers=2,
+                 mixer_fusion="gated_sum",
+                 use_merge_norm=False):
         super().__init__()
 
         # Setup mixers per stage
@@ -350,7 +405,17 @@ class Typhon(torch.nn.Module):
                 zip(embed_dim, qk_dim, partial_dim, depth, down_ops, types)):
             stage_mixers = mixers_per_stage[i]
             for d in range(dpth):
-                eval('self.blocks' + str(i+1)).append(TyphonBasicBlock(ed, kd, pd, t, num_mixers=stage_mixers))
+                eval('self.blocks' + str(i+1)).append(
+                    TyphonBasicBlock(
+                        ed,
+                        kd,
+                        pd,
+                        t,
+                        num_mixers=stage_mixers,
+                        mixer_fusion=mixer_fusion,
+                        use_merge_norm=use_merge_norm,
+                    )
+                )
             if do[0] == 'subsample':
                 # Build SHViT downsample block (identical to original)
                 blk = eval('self.blocks' + str(i+2))
@@ -489,32 +554,32 @@ def shvit_s4(num_classes=1000, pretrained=False, distillation=False, fuse=False,
 
 
 @register_model
-def typhon_s1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s1, num_mixers=2):
-    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+def typhon_s1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s1, num_mixers=2, mixer_fusion="gated_sum", use_merge_norm=False):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, mixer_fusion=mixer_fusion, use_merge_norm=use_merge_norm, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 
 
 @register_model
-def typhon_s2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s2, num_mixers=2):
-    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+def typhon_s2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s2, num_mixers=2, mixer_fusion="gated_sum", use_merge_norm=False):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, mixer_fusion=mixer_fusion, use_merge_norm=use_merge_norm, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 
 
 @register_model
-def typhon_s3(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s3, num_mixers=2):
-    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+def typhon_s3(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s3, num_mixers=2, mixer_fusion="gated_sum", use_merge_norm=False):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, mixer_fusion=mixer_fusion, use_merge_norm=use_merge_norm, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 
 
 @register_model
-def typhon_s4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s4, num_mixers=2):
-    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+def typhon_s4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s4, num_mixers=2, mixer_fusion="gated_sum", use_merge_norm=False):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, mixer_fusion=mixer_fusion, use_merge_norm=use_merge_norm, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model

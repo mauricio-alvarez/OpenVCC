@@ -81,7 +81,11 @@ if __name__ == '__main__':
         output_file_name="typhon_s1_imagenet1k.pth",
         batch_size=256,
         num_mixers=2,
-        resume_checkpoint="4_typhon_s1_imagenet1k.pth"
+        resume_checkpoint=None,
+        mixer_fusion="gated_sum",
+        use_merge_norm=False,
+        distill_weight=0.5,
+        distill_temperature=2.0,
     )
     
     '''
