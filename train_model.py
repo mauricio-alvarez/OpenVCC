@@ -204,7 +204,6 @@ def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda', mod
         else:
             model_cfg = SHViT_s1
             
-    # Always initialize with 1000 classes to match standard checkpoints
     monster = DoubleHeadSHViT(num_classes=num_classes, **model_cfg)
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -213,19 +212,24 @@ def load_finetuned_monster(checkpoint_path, num_classes=1000, device='cuda', mod
     else:
         state_dict = checkpoint
     
+    # Filter out mismatching parameters (e.g. classifier head from a different number of classes)
+    model_state_dict = monster.state_dict()
+    filtered_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict:
+            if v.shape == model_state_dict[k].shape:
+                filtered_state_dict[k] = v
+            else:
+                print(f"  Skipping parameter '{k}' due to size mismatch: model shape {model_state_dict[k].shape} vs checkpoint shape {v.shape}")
+        else:
+            filtered_state_dict[k] = v
+
     # Handle both old (router+head) and new (head_A+head_B) checkpoint formats
-    missing, unexpected = monster.load_state_dict(state_dict, strict=False)
+    missing, unexpected = monster.load_state_dict(filtered_state_dict, strict=False)
     if missing:
-        print(f"  Missing keys (expected for format change): {len(missing)} keys")
+        print(f"  Missing keys: {len(missing)} keys")
     if unexpected:
-        print(f"  Unexpected keys (from old format): {len(unexpected)} keys")
-    
-    # If the user requested a different number of classes, replace both heads
-    if num_classes != 1000:
-        print(f"Modifying heads: 1000 -> {num_classes} classes")
-        in_features = monster.head_A.l.in_features
-        monster.head_A = BN_Linear(in_features, num_classes)
-        monster.head_B = BN_Linear(in_features, num_classes)
+        print(f"  Unexpected keys: {len(unexpected)} keys")
         
     monster.to(device)
     monster.eval()
@@ -295,7 +299,6 @@ def load_finetuned_triple_monster(checkpoint_path, num_classes=1000, device='cud
         else:
             model_cfg = SHViT_s1
             
-    # Always initialize with 1000 classes to match standard checkpoints
     monster = TripleHeadSHViT(num_classes=num_classes, **model_cfg)
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -304,14 +307,20 @@ def load_finetuned_triple_monster(checkpoint_path, num_classes=1000, device='cud
     else:
         state_dict = checkpoint
         
-    monster.load_state_dict(state_dict, strict=False)
+    # Filter out mismatching parameters
+    model_state_dict = monster.state_dict()
+    filtered_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict:
+            if v.shape == model_state_dict[k].shape:
+                filtered_state_dict[k] = v
+            else:
+                print(f"  Skipping parameter '{k}' due to size mismatch: model shape {model_state_dict[k].shape} vs checkpoint shape {v.shape}")
+        else:
+            filtered_state_dict[k] = v
+
+    monster.load_state_dict(filtered_state_dict, strict=False)
     
-    # If the user requested a different number of classes, replace the head
-    if num_classes != 1000:
-        print(f"Modifying head: 1000 -> {num_classes} classes")
-        in_features = monster.head.l.in_features
-        monster.head = BN_Linear(in_features, num_classes)
-        
     monster.to(device)
     monster.eval()
     print("Triple Monster loaded and ready!")
@@ -1301,4 +1310,604 @@ def test_imagenet_r(model):
     print('\nDelta Acc (%):\t\t', round(100*(acc_orig - acc_r), 2))
     hook_handle.remove()
 
+
+def build_and_load_typhon(original_shvit, num_classes=1000, model_cfg=None, num_mixers=2):
+    from SHViT import Typhon, TyphonBasicBlock
+    import torch
     
+    if model_cfg is None:
+        model_cfg = {}
+    print(f"Building Typhon with {num_mixers} mixers...")
+    typhon = Typhon(num_classes=num_classes, num_mixers=num_mixers, **model_cfg)
+    
+    print(" - Copying Shared Stem...")
+    typhon.patch_embed.load_state_dict(original_shvit.patch_embed.state_dict())
+    
+    print(" - Copying Classification Head...")
+    if typhon.head.l.out_features == original_shvit.head.l.out_features:
+        typhon.head.load_state_dict(original_shvit.head.state_dict())
+    else:
+        print(f"Skipping head state copy due to class output mismatch: {original_shvit.head.l.out_features} (src) vs {typhon.head.l.out_features} (dest)")
+    
+    print(" - Copying blocks and duplicating mixers...")
+    
+    def copy_stage(src_seq, dest_seq):
+        for src_blk, dest_blk in zip(src_seq, dest_seq):
+            if isinstance(dest_blk, TyphonBasicBlock):
+                if dest_blk.type == 's':
+                    # Copy conv & ffn
+                    dest_blk.conv.load_state_dict(src_blk.conv.state_dict())
+                    dest_blk.ffn.load_state_dict(src_blk.ffn.state_dict())
+                    # Copy shared projection layer
+                    dest_blk.proj.load_state_dict(src_blk.mixer.m.proj.state_dict())
+                    # Copy the single mixer to all mixers in Typhon block (excl. proj)
+                    src_mixer_state = {k: v for k, v in src_blk.mixer.m.state_dict().items() if not k.startswith("proj")}
+                    for k in range(dest_blk.num_mixers):
+                        dest_blk.mixers[k].load_state_dict(src_mixer_state)
+                        # Add tiny noise for symmetry breaking
+                        if k > 0:
+                            for param in dest_blk.mixers[k].parameters():
+                                param.data += torch.randn_like(param.data) * 1e-4
+                else:
+                    # Early stage type 'i' block
+                    dest_blk.load_state_dict(src_blk.state_dict())
+            else:
+                # Downsample blocks (nn.Sequential or PatchMerging)
+                dest_blk.load_state_dict(src_blk.state_dict())
+
+    copy_stage(original_shvit.blocks1, typhon.blocks1)
+    copy_stage(original_shvit.blocks2, typhon.blocks2)
+    copy_stage(original_shvit.blocks3, typhon.blocks3)
+    
+    print("Typhon initialized successfully from SHViT weights!")
+    return typhon
+
+
+def load_finetuned_typhon(checkpoint_path, num_classes=1000, device='cuda', num_mixers=2, model_cfg=None):
+    from SHViT import Typhon, SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
+    import torch
+    import os
+    
+    print(f"Loading finetuned Typhon from {checkpoint_path}...")
+    if model_cfg is None:
+        if 's4' in checkpoint_path:
+            model_cfg = SHViT_s4
+        elif 's3' in checkpoint_path:
+            model_cfg = SHViT_s3
+        elif 's2' in checkpoint_path:
+            model_cfg = SHViT_s2
+        else:
+            model_cfg = SHViT_s1
+            
+    model = Typhon(num_classes=num_classes, num_mixers=num_mixers, **model_cfg)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    
+    # Filter out mismatching parameters
+    model_state_dict = model.state_dict()
+    filtered_state_dict = {}
+    for k, v in state_dict.items():
+        if k in model_state_dict:
+            if v.shape == model_state_dict[k].shape:
+                filtered_state_dict[k] = v
+            else:
+                print(f"  Skipping parameter '{k}' due to size mismatch: model shape {model_state_dict[k].shape} vs checkpoint shape {v.shape}")
+        else:
+            filtered_state_dict[k] = v
+
+    model.load_state_dict(filtered_state_dict, strict=False)
+    model.to(device)
+    model.eval()
+    print("Typhon loaded successfully!")
+    return model
+
+
+def train_typhon(use_shvit, model_location, loader_train, loader_eval, NUM_CLASS, NUM_EPOCHS, output_file_name, num_mixers=2, resume_checkpoint=None):
+    from SHViT import SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
+    import torch
+    import os
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    shvit_name = 's1'
+    model_cfg = SHViT_s1
+    if 's4' in model_location:
+        shvit_name = 's4'
+        model_cfg = SHViT_s4
+    elif 's3' in model_location:
+        shvit_name = 's3'
+        model_cfg = SHViT_s3
+    elif 's2' in model_location:
+        shvit_name = 's2'
+        model_cfg = SHViT_s2
+
+    # 1. Initialize or Load Typhon Model
+    if use_shvit:
+        print(f"Loading original SHViT {shvit_name} to initialize Typhon...")
+        original_model = build_shvit(shvit_name, model_location, classes_output=1000)
+        model = build_and_load_typhon(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg, num_mixers=num_mixers)
+    else:
+        model = load_finetuned_typhon(model_location, num_classes=NUM_CLASS, device=device, num_mixers=num_mixers, model_cfg=model_cfg)
+    
+    freeze_stage_1(model)
+    model.to(device)
+
+    # 2. Setup Training
+    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.AdamW(param_groups, lr=1e-4, weight_decay=0.05)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    criterion = torch.nn.CrossEntropyLoss()
+    scaler = NativeScaler()
+
+    start_epoch = 0
+    best_acc = 0.0
+
+    if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_acc' in checkpoint:
+                best_acc = checkpoint['best_acc']
+        else:
+            model.load_state_dict(checkpoint)
+            print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
+
+    print("Starting Fine-tuning (Typhon)...")
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        model.train()
+        total_loss = 0
+        num_steps = 0
+
+        for batch_idx, (input, target) in enumerate(loader_train):
+            input, target = input.to(device), target.to(device)
+
+            optimizer.zero_grad()
+
+            # AMP Context
+            with torch.cuda.amp.autocast():
+                output = model(input)
+                loss = criterion(output, target)
+
+            scaler(loss, optimizer)
+
+            total_loss += loss.item()
+            num_steps += 1
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch}: Step {batch_idx} Loss {loss.item():.4f}")
+        scheduler.step()
+        
+        # Validation
+        acc = validate(model, loader_eval, device)
+        print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
+
+        # Save Checkpoint
+        if acc > best_acc or epoch % 20 == 0:
+            best_acc = acc
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'best_acc': best_acc
+            }
+            torch.save(checkpoint_dict, str(epoch) + "_" + output_file_name)
+            print(f"Saved model with acc {acc:.2f}%")
+            
+    return model
+
+
+def train_typhon_imagenet_1k(use_shvit, model_location, NUM_EPOCHS, output_file_name, batch_size=256, num_mixers=2, resume_checkpoint=None):
+    from SHViT import SHViT_s1, SHViT_s2, SHViT_s3, SHViT_s4
+    import torch
+    import os
+    from torchvision import datasets, transforms
+    from torch.utils.data import DataLoader
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    shvit_name = 's1'
+    model_cfg = SHViT_s1
+    if 's4' in model_location:
+        shvit_name = 's4'
+        model_cfg = SHViT_s4
+    elif 's3' in model_location:
+        shvit_name = 's3'
+        model_cfg = SHViT_s3
+    elif 's2' in model_location:
+        shvit_name = 's2'
+        model_cfg = SHViT_s2
+
+    # 1. Initialize or Load Typhon Model
+    NUM_CLASS = 1000
+    if use_shvit:
+        print(f"Loading original SHViT {shvit_name} to initialize Typhon...")
+        original_model = build_shvit(shvit_name, model_location, classes_output=1000)
+        model = build_and_load_typhon(original_model, num_classes=NUM_CLASS, model_cfg=model_cfg, num_mixers=num_mixers)
+    else:
+        model = load_finetuned_typhon(model_location, num_classes=NUM_CLASS, device=device, num_mixers=num_mixers, model_cfg=model_cfg)
+    
+    freeze_stage_1(model)
+    model.to(device)
+
+    # 2. Data Loading for ImageNet-1K
+    print("Preparing ImageNet-1K Dataloaders...")
+    train_dir = "/home/mauricio.alvarez/tesis/archive/imagenet_train/"
+    val_dir = "/home/mauricio.alvarez/tesis/archive/imagenet-val/imagenet-val"
+
+    if not os.path.exists(train_dir):
+        raise ValueError(f"ImageNet train directory not found: {train_dir}")
+    if not os.path.exists(val_dir):
+        raise ValueError(f"ImageNet validation directory not found: {val_dir}")
+
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    transform_val = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = datasets.ImageFolder(train_dir, transform=transform_train)
+    val_dataset = datasets.ImageFolder(val_dir, transform=transform_val)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=8, pin_memory=True, prefetch_factor=2
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=8, pin_memory=True, prefetch_factor=2
+    )
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+
+    # 3. Setup Training
+    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.AdamW(param_groups, lr=1e-4, weight_decay=0.05)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    criterion = torch.nn.CrossEntropyLoss()
+    scaler = NativeScaler()
+
+    start_epoch = 0
+    best_acc = 0.0
+
+    if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            if 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_acc' in checkpoint:
+                best_acc = checkpoint['best_acc']
+        else:
+            model.load_state_dict(checkpoint)
+            print("Warning: Checkpoint did not contain optimizer/scheduler state. Only model weights loaded.")
+
+    print("Starting Fine-tuning (Typhon on ImageNet-1K)...")
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        model.train()
+        total_loss = 0
+        num_steps = 0
+
+        for batch_idx, (input, target) in enumerate(train_loader):
+            input, target = input.to(device), target.to(device)
+
+            optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                output = model(input)
+                loss = criterion(output, target)
+
+            scaler(loss, optimizer)
+
+            total_loss += loss.item()
+            num_steps += 1
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch}: Step {batch_idx}/{len(train_loader)} Loss {loss.item():.4f}")
+        scheduler.step()
+        
+        # Validation
+        acc = validate(model, val_loader, device)
+        print(f"Epoch {epoch} Done. Avg Loss: {total_loss/num_steps:.4f} | Val Acc: {acc:.2f}%")
+
+        # Save Checkpoint
+        if acc > best_acc or epoch % 10 == 0:
+            best_acc = acc
+            checkpoint_dict = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'best_acc': best_acc
+            }
+            torch.save(checkpoint_dict, str(epoch) + "_" + output_file_name)
+            print(f"Saved model with acc {acc:.2f}%")
+    test_imagenet_r(model)
+    test_imagenet_1k(model, set_name='val')       
+    return model
+
+
+def test_fashion_mnist(model, num_epochs=2, use_subset=True):
+    from SHViT import BN_Linear
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torchvision import datasets, transforms
+    from torch.utils.data import DataLoader, Subset
+    import numpy as np
+    from sklearn.metrics import confusion_matrix
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from functools import partial
+    import torch.nn.functional as F
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if hasattr(model, 'module'):
+        base_model = model.module
+    else:
+        base_model = model
+
+    # 1. Check/Replace Head for 10 classes
+    if hasattr(base_model, 'head_A') and hasattr(base_model, 'head_B'):
+        # Double-head model
+        for head_name in ['head_A', 'head_B']:
+            head_module = getattr(base_model, head_name)
+            if hasattr(head_module, 'l') and isinstance(head_module.l, nn.Linear):
+                if head_module.l.out_features != 10:
+                    print(f"Replacing BN_Linear {head_name}: {head_module.l.out_features} -> 10 classes")
+                    in_features = head_module.l.in_features
+                    setattr(base_model, head_name, BN_Linear(in_features, 10))
+            elif isinstance(head_module, nn.Linear):
+                if head_module.out_features != 10:
+                    print(f"Replacing Linear {head_name}: {head_module.out_features} -> 10 classes")
+                    in_features = head_module.in_features
+                    setattr(base_model, head_name, nn.Linear(in_features, 10))
+    elif hasattr(base_model, 'head'):
+        if hasattr(base_model.head, 'l'):
+            # BN_Linear (SHViT / Typhon style)
+            if base_model.head.l.out_features != 10:
+                print(f"Replacing BN_Linear head: {base_model.head.l.out_features} -> 10 classes")
+                in_features = base_model.head.l.in_features
+                base_model.head = BN_Linear(in_features, 10)
+        elif isinstance(base_model.head, nn.Linear):
+            if base_model.head.out_features != 10:
+                print(f"Replacing Linear head: {base_model.head.out_features} -> 10 classes")
+                in_features = base_model.head.in_features
+                base_model.head = nn.Linear(in_features, 10)
+    elif hasattr(base_model, 'heads') and hasattr(base_model.heads, 'head'):
+        # torchvision ViT style
+        if base_model.heads.head.out_features != 10:
+            print(f"Replacing heads.head layer: {base_model.heads.head.out_features} -> 10 classes")
+            in_features = base_model.heads.head.in_features
+            base_model.heads.head = nn.Linear(in_features, 10)
+    
+    model.to(device)
+
+    # 2. Data Loading
+    print("Preparing Fashion MNIST Dataset...")
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    train_set = datasets.FashionMNIST(root='./data_mnist', train=True, download=True, transform=transform)
+    test_set = datasets.FashionMNIST(root='./data_mnist', train=False, download=True, transform=transform)
+
+    if use_subset:
+        train_subset = Subset(train_set, range(2000))
+        test_subset = Subset(test_set, range(500))
+    else:
+        train_subset = train_set
+        test_subset = test_set
+
+    train_loader = DataLoader(train_subset, batch_size=64, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_subset, batch_size=64, shuffle=False, num_workers=2)
+
+    # 3. Fine-tuning
+    print(f"Fine-tuning model on Fashion MNIST for {num_epochs} epochs...")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                if isinstance(outputs, tuple) and len(outputs) == 4:
+                    logits_A, logits_B, feat_A, feat_B = outputs
+                    loss_A = criterion(logits_A, targets)
+                    loss_B = criterion(logits_B, targets)
+                    # Diversity loss to push branches apart
+                    diversity = (F.cosine_similarity(feat_A, feat_B, dim=1) ** 2).mean()
+                    loss = loss_A + loss_B + 0.5 * diversity
+                    outputs_for_acc = (logits_A + logits_B) / 2
+                else:
+                    loss = criterion(outputs, targets)
+                    outputs_for_acc = outputs
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs_for_acc.max(1)
+            total_train += targets.size(0)
+            correct_train += predicted.eq(targets).sum().item()
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_acc = (correct_train / total_train) * 100
+        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {epoch_loss:.4f} - Acc: {epoch_acc:.2f}%")
+
+    
+    print("Evaluating model...")
+    model.eval()
+
+    is_double_head = hasattr(base_model, 'head_A') and hasattr(base_model, 'head_B')
+    temp_features = {}
+
+    if is_double_head:
+        def generic_hook_a(module, input, output):
+            temp_features["feat_A"] = input[0]
+        def generic_hook_b(module, input, output):
+            temp_features["feat_B"] = input[0]
+
+        hook_handle_a = base_model.head_A.register_forward_hook(generic_hook_a)
+        hook_handle_b = base_model.head_B.register_forward_hook(generic_hook_b)
+    else:
+        def generic_hook(module, input, output, name):
+            temp_features[name] = input[0]
+
+        # Helper function to find last layer
+        def get_last_layer(model):
+            if hasattr(model, 'module'):
+                base_model = model.module
+            else:
+                base_model = model
+                
+            if hasattr(base_model, 'head'):
+                return base_model.head
+            elif hasattr(base_model, 'fc'):
+                return base_model.fc
+            elif hasattr(base_model, 'classifier'):
+                return base_model.classifier
+            else:
+                return list(base_model.children())[-1]
+
+        last_layer = get_last_layer(model)
+        hook_handle = last_layer.register_forward_hook(partial(generic_hook, name="feat"))
+
+    eval_features = []
+    eval_logits = []
+    correct_list = []
+    preds_list = []
+
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+
+            if is_double_head:
+                if "feat_A" not in temp_features or "feat_B" not in temp_features:
+                    raise RuntimeError("Hooks failed to trigger for double head!")
+                # Ensemble feature averaging
+                feat = (temp_features["feat_A"] + temp_features["feat_B"]) / 2
+                del temp_features["feat_A"]
+                del temp_features["feat_B"]
+            else:
+                if "feat" not in temp_features:
+                    raise RuntimeError(f"Hook failed to trigger! Attached to: {last_layer}")
+                feat = temp_features["feat"]
+                del temp_features["feat"]
+
+            eval_logits.append(outputs.detach().cpu())
+            eval_features.append(feat.detach().cpu())
+            correct_list.extend(targets.cpu().numpy())
+
+            probs = F.softmax(outputs, dim=1)
+            _, predicted = probs.max(1)
+            preds_list.extend(predicted.cpu().numpy())
+
+    eval_logits = torch.cat(eval_logits)
+    eval_features = torch.cat(eval_features)
+    targets = np.array(correct_list)
+    preds = np.array(preds_list)
+
+    correct = (preds == targets).astype(float)
+    num_correct = correct.sum()
+    acc = num_correct / len(correct)
+
+    # Compute all confidence scores
+    scores = {}
+    probs = F.softmax(eval_logits, dim=1)
+    scores['msp'] = probs.max(1)[0].numpy()
+    scores['neg_entropy'] = torch.sum(probs * torch.log(probs + 1e-12), dim=1).numpy()
+    scores['ml'] = eval_logits.max(1)[0].numpy()
+    scores['energy'] = torch.logsumexp(eval_logits, dim=1).numpy()
+
+    dataset_name = 'Fashion MNIST'
+    print(f'\n========================================')
+    print(f'{dataset_name} Results')
+    print(f'Accuracy (%):\t\t {round(100 * acc, 2)}')
+    
+    correct_mask = (correct == 1.0)
+    msp_correct = scores['msp'][correct_mask].mean() if correct_mask.sum() > 0 else 0
+    msp_incorrect = scores['msp'][~correct_mask].mean() if (~correct_mask).sum() > 0 else 0
+    print(f'Mean MSP (Correct):\t {msp_correct:.4f}')
+    print(f'Mean MSP (Incorrect):\t {msp_incorrect:.4f}')
+        
+    # Save Confusion Matrix
+    cm = confusion_matrix(targets, preds)
+    cm_filename = f'confusion_matrix_{dataset_name.replace(" ", "_")}.npy'
+    np.save(cm_filename, cm)
+    print(f'Saved Confusion Matrix array to: {cm_filename}')
+    
+    # Save as PNG
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title(f'Confusion Matrix: {dataset_name}')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    png_filename = f'confusion_matrix_{dataset_name.replace(" ", "_")}.png'
+    plt.savefig(png_filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'Saved Confusion Matrix image to: {png_filename}')
+    
+    print('\nAURRA (%):')
+    for metric_name, confidence in scores.items():
+        aurra_val = aurra(confidence, correct) * 100
+        print(f'  {metric_name:<15}: {aurra_val:.2f}')
+        
+    rmsce = calib_err(scores['msp'], correct, p='2') * 100
+    ece = calib_err(scores['msp'], correct, p='1') * 100
+    print(f'\nRMS Calib Error (RMSCE) [%]: {rmsce:.2f}')
+    print(f'Expected Calib Error (ECE) [%]: {ece:.2f}')
+    print(f'========================================')
+
+    if is_double_head:
+        hook_handle_a.remove()
+        hook_handle_b.remove()
+    else:
+        hook_handle.remove()
+    return acc

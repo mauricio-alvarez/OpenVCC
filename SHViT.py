@@ -185,6 +185,73 @@ class BasicBlock(torch.nn.Module):
         return self.ffn(self.mixer(self.conv(x)))
 
 
+class TyphonAttention(torch.nn.Module):
+    """Mixer that performs Single-Head Self-Attention on input channels"""
+    def __init__(self, qk_dim, pdim):
+        super().__init__()
+        self.scale = qk_dim ** -0.5
+        self.qk_dim = qk_dim
+        self.pdim = pdim
+
+        self.pre_norm = GroupNorm(pdim)
+        self.qkv = Conv2d_BN(pdim, qk_dim * 2 + pdim)
+
+    def forward(self, x1):
+        B, C, H, W = x1.shape
+        x1 = self.pre_norm(x1)
+        qkv = self.qkv(x1)
+        q, k, v = qkv.split([self.qk_dim, self.qk_dim, self.pdim], dim=1)
+        q, k, v = q.flatten(2), k.flatten(2), v.flatten(2)
+        
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x1_out = (v @ attn.transpose(-2, -1)).reshape(B, self.pdim, H, W)
+        return x1_out
+
+
+class TyphonBasicBlock(torch.nn.Module):
+    def __init__(self, dim, qk_dim, pdim, type, num_mixers=1):
+        super().__init__()
+        self.type = type
+        self.dim = dim
+        self.pdim = pdim
+        self.num_mixers = num_mixers
+        
+        self.conv = Residual(Conv2d_BN(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0))
+        
+        if type == "s":    # for later stages
+            self.mixers = torch.nn.ModuleList([TyphonAttention(qk_dim, pdim) for _ in range(num_mixers)])
+            self.norm = GroupNorm(pdim)
+            self.proj = torch.nn.Sequential(
+                torch.nn.ReLU(),
+                Conv2d_BN(dim, dim, bn_weight_init=0)
+            )
+            self.ffn = Residual(FFN(dim, int(dim * 2)))
+        elif type == "i":   # for early stages
+            self.mixers = torch.nn.Identity()
+            self.ffn = Residual(FFN(dim, int(dim * 2)))
+    
+    def forward(self, x):
+        x = self.conv(x)
+        if self.type == "s":
+            # 1. Split active (x1) and passive (x2) channels
+            x1, x2 = torch.split(x, [self.pdim, self.dim - self.pdim], dim=1)
+            
+            # 2. Evaluate all mixers on x1 in parallel and sum their outputs
+            x1_merged = sum(mixer(x1) for mixer in self.mixers)
+            x1_merged = self.norm(x1_merged)
+            
+            # 3. Concatenate back with the single bypassed x2 path
+            x_cat = torch.cat([x1_merged, x2], dim=1)
+            
+            # 4. Project once and apply residual connection
+            x = x + self.proj(x_cat)
+            
+        x = self.ffn(x)
+        return x
+
+
+
 class SHViT(torch.nn.Module):
     def __init__(self,
                  in_chans=3,
@@ -216,6 +283,76 @@ class SHViT(torch.nn.Module):
             if do[0] == 'subsample':
                 # Build SHViT downsample block
                 #('Subsample' stride)
+                blk = eval('self.blocks' + str(i+2))
+                blk.append(torch.nn.Sequential(Residual(Conv2d_BN(embed_dim[i], embed_dim[i], 3, 1, 1, groups=embed_dim[i])),
+                                    Residual(FFN(embed_dim[i], int(embed_dim[i] * 2))),))
+                blk.append(PatchMerging(*embed_dim[i:i + 2]))
+                
+                blk.append(torch.nn.Sequential(Residual(Conv2d_BN(embed_dim[i + 1], embed_dim[i + 1], 3, 1, 1, groups=embed_dim[i + 1])),
+                                    Residual(FFN(embed_dim[i + 1], int(embed_dim[i + 1] * 2))),))
+        self.blocks1 = torch.nn.Sequential(*self.blocks1)
+        self.blocks2 = torch.nn.Sequential(*self.blocks2)
+        self.blocks3 = torch.nn.Sequential(*self.blocks3)
+        
+        # Classification head
+        self.head = BN_Linear(embed_dim[-1], num_classes) if num_classes > 0 else torch.nn.Identity()
+        self.distillation = distillation
+        if distillation:
+            self.head_dist = BN_Linear(embed_dim[-1], num_classes) if num_classes > 0 else torch.nn.Identity()
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = self.blocks1(x)
+        x = self.blocks2(x)
+        x = self.blocks3(x)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, 1).flatten(1)
+        if self.distillation:
+            x = self.head(x), self.head_dist(x)
+            if not self.training:
+                x = (x[0] + x[1]) / 2
+        else:
+            x = self.head(x)
+        return x
+
+
+class Typhon(torch.nn.Module):
+    def __init__(self,
+                 in_chans=3,
+                 num_classes=1000,
+                 embed_dim=[128, 256, 384],
+                 partial_dim = [32, 64, 96],
+                 qk_dim=[16, 16, 16],
+                 depth=[1, 2, 3],
+                 types = ["s", "s", "s"],
+                 down_ops=[['subsample', 2], ['subsample', 2], ['']],
+                 distillation=False,
+                 num_mixers=2):
+        super().__init__()
+
+        # Setup mixers per stage
+        if isinstance(num_mixers, int):
+            mixers_per_stage = [num_mixers] * len(depth)
+        else:
+            mixers_per_stage = list(num_mixers)
+
+        # Patch embedding
+        self.patch_embed = torch.nn.Sequential(Conv2d_BN(in_chans, embed_dim[0] // 8, 3, 2, 1), torch.nn.ReLU(),
+                           Conv2d_BN(embed_dim[0] // 8, embed_dim[0] // 4, 3, 2, 1), torch.nn.ReLU(),
+                           Conv2d_BN(embed_dim[0] // 4, embed_dim[0] // 2, 3, 2, 1), torch.nn.ReLU(),
+                           Conv2d_BN(embed_dim[0] // 2, embed_dim[0], 3, 2, 1))
+
+        self.blocks1 = []
+        self.blocks2 = []
+        self.blocks3 = []
+
+        # Build Typhon blocks
+        for i, (ed, kd, pd, dpth, do, t) in enumerate(
+                zip(embed_dim, qk_dim, partial_dim, depth, down_ops, types)):
+            stage_mixers = mixers_per_stage[i]
+            for d in range(dpth):
+                eval('self.blocks' + str(i+1)).append(TyphonBasicBlock(ed, kd, pd, t, num_mixers=stage_mixers))
+            if do[0] == 'subsample':
+                # Build SHViT downsample block (identical to original)
                 blk = eval('self.blocks' + str(i+2))
                 blk.append(torch.nn.Sequential(Residual(Conv2d_BN(embed_dim[i], embed_dim[i], 3, 1, 1, groups=embed_dim[i])),
                                     Residual(FFN(embed_dim[i], int(embed_dim[i] * 2))),))
@@ -350,6 +487,37 @@ def shvit_s4(num_classes=1000, pretrained=False, distillation=False, fuse=False,
         replace_batchnorm(model)
     return model
 
+
+@register_model
+def typhon_s1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s1, num_mixers=2):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+    if fuse:
+        replace_batchnorm(model)
+    return model
+
+
+@register_model
+def typhon_s2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s2, num_mixers=2):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+    if fuse:
+        replace_batchnorm(model)
+    return model
+
+
+@register_model
+def typhon_s3(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s3, num_mixers=2):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+    if fuse:
+        replace_batchnorm(model)
+    return model
+
+
+@register_model
+def typhon_s4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=SHViT_s4, num_mixers=2):
+    model = Typhon(num_classes=num_classes, distillation=distillation, num_mixers=num_mixers, **model_cfg)
+    if fuse:
+        replace_batchnorm(model)
+    return model
 
 
 def replace_batchnorm(net):

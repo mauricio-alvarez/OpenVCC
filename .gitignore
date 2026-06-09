@@ -14,6 +14,9 @@ __pycache__/
 env/
 venv/
 yellowbrick/
+imagenet_val_for_imagenet_r/
 *.log
 *.err
-
+*.pth
+*.npy
+*.txt
